@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NetLedger.Core/NetLedger.Core.csproj" />
+    <Project Path="src/NetLedger.Service/NetLedger.Service.csproj" />
+    <Project Path="src/NetLedger.Tray/NetLedger.Tray.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NetLedger.Tests/NetLedger.Tests.csproj" />
+  </Folder>
+</Solution>

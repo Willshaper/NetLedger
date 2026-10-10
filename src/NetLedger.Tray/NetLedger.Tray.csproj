@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>NetLedger.Tray</RootNamespace>
+    <AssemblyName>NetLedger</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationIcon>Resources\NetLedger.ico</ApplicationIcon>
+    <!-- WFO5001: dark mode is still flagged experimental. WFO1000: no designer, so no designer serialization. -->
+    <NoWarn>$(NoWarn);WFO5001;WFO1000</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\NetLedger.ico" LogicalName="NetLedger.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetLedger.Core\NetLedger.Core.csproj" />
+  </ItemGroup>
+
+</Project>
