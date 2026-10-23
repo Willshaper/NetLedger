@@ -46,7 +46,9 @@ Some details worth knowing:
 ## Install
 
 1. Install the [.NET 10 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0) if you don't have it. The installer checks for it.
-2. Run `NetLedger-Setup-<version>.exe`. It asks for administrator rights once, to register the service.
+2. Download `NetLedger-Setup-<version>.exe` from [Releases](https://github.com/Willshaper/NetLedger/releases) and run it. It asks for administrator rights once, to register the service.
+
+The installer isn't code-signed, so Windows SmartScreen may warn the first time: choose **More info → Run anyway**.
 
 Running the installer again updates an existing install and keeps your history. Uninstalling removes the service, and asks whether to keep your recorded history.
 
@@ -83,6 +85,20 @@ A few things to know about the console service:
 - It can't answer the tray app while an installed NetLedger service is running, because both use the same pipe name. Stop the installed service first.
 - To run the published build as a real service without the installer, use `scripts\install-dev.ps1` from an elevated prompt. It copies the build to `%ProgramFiles%\NetLedger-dev` and registers the service from there, because a SYSTEM service shouldn't run from a folder your user account can write to. `-Remove` undoes it.
 
+## Releasing
+
+GitHub Actions builds and tests every push to `main`. To publish a release:
+
+1. Set `<Version>` in `Directory.Build.props` (e.g. `0.2.0`) and commit.
+2. Tag the commit with the same version and push the tag:
+
+   ```powershell
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+The release workflow builds the installer and publishes it as a GitHub Release, with every commit message since the previous tag as the notes. It refuses a tag that doesn't match `<Version>`.
+
 ## Project layout
 
 ```
@@ -91,6 +107,7 @@ src/NetLedger.Service   the Windows service: collection, ETW, outage checks, SQL
 src/NetLedger.Tray      the WinForms app: taskbar widget, statistics, settings, notifications
 tests/NetLedger.Tests   unit tests (DST handling, billing cycles, counters, storage, import/export, merging)
 installer/              Inno Setup script
+.github/workflows/      CI (build and test) and the tag-triggered release
 scripts/                publish, dev install and icon scripts
 docs/images/            screenshots used in this README
 ```

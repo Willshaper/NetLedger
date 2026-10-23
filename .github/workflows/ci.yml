@@ -1,0 +1,28 @@
+name: CI
+
+# Builds the solution and runs the tests on every push and pull request to main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Build
+        run: dotnet build NetLedger.slnx -c Release
+
+      - name: Test
+        run: dotnet test --project tests/NetLedger.Tests -c Release --no-build

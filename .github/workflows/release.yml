@@ -1,0 +1,76 @@
+name: Release
+
+# Pushing a version tag (e.g. v0.1.0) builds the installer and publishes it as a GitHub Release.
+# The tag must match <Version> in Directory.Build.props.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history and tags, for the release notes
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Check the tag matches the version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content Directory.Build.props)).Project.PropertyGroup.Version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            Write-Output "::error::Tag $env:GITHUB_REF_NAME doesn't match Version $version in Directory.Build.props (expected v$version)."
+            exit 1
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: dotnet test --project tests/NetLedger.Tests -c Release
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+          }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          ./scripts/publish.ps1
+          $installer = "installer/Output/NetLedger-Setup-$env:VERSION.exe"
+          if (-not (Test-Path $installer)) {
+            Write-Output "::error::$installer wasn't built."
+            exit 1
+          }
+          "INSTALLER=$installer" >> $env:GITHUB_ENV
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Notes: every commit message since the previous tag, oldest first, plus a compare link.
+          prev=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          git log --reverse --format='%B' "${prev:+$prev..}$GITHUB_REF_NAME" > notes.md
+          if [ -n "$prev" ]; then
+            echo "Full changelog: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$GITHUB_REF_NAME" >> notes.md
+          fi
+          {
+            echo
+            echo "---"
+            echo "Needs the [.NET 10 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0); the installer checks for it."
+            echo "The installer isn't code-signed, so Windows SmartScreen may warn on first run: choose **More info → Run anyway**."
+          } >> notes.md
+          gh release create "$GITHUB_REF_NAME" "$INSTALLER" \
+            --title "NetLedger $GITHUB_REF_NAME" \
+            --notes-file notes.md
