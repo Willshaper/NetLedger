@@ -5,19 +5,21 @@ using NetLedger.Core.Native;
 
 namespace NetLedger.Tray;
 
-internal sealed class SettingsForm : Form
+internal sealed class SettingsForm : ScaledForm
 {
     private readonly LedgerClient _client;
     private readonly BackupFlow _backup;
     private readonly UiSettings _edit;
-    private readonly TabControl _tabs = new();
+    private readonly FlowLayoutPanel _pageStrip = new();
+    private readonly Panel _pageHost = new();
+    private readonly List<(NavButton Button, Panel Page)> _pages = new();
 
     // General
     private readonly CheckBox _startup = new() { Text = "Start NetLedger when I sign in", AutoSize = true };
     private readonly ComboBox _units = Combo("Automatic (bits: Kbit, Mbit, Gbit)", "Kbit", "Mbit", "Automatic (bytes: KB/s, MB/s, GB/s)", "KB/s", "MB/s");
     private readonly NumericUpDown _smoothing = Number(1, 10);
     private readonly ComboBox _sizeBase = Combo("Binary: 1 GB = 1024 MB (like Windows)", "Decimal: 1 GB = 1000 MB (like most ISPs)");
-    private readonly ComboBox _weekStart = Combo(CultureInfo.CurrentCulture.DateTimeFormat.DayNames);
+    private readonly ComboBox _weekStart = Combo(Enum.GetNames<DayOfWeek>());
 
     // Taskbar
     private readonly ComboBox _placement = Combo("Inside the taskbar (recommended)", "Floating over the taskbar");
@@ -32,8 +34,6 @@ internal sealed class SettingsForm : Form
 
     // Adapters
     private readonly ListView _adapterList = new();
-    private readonly Dictionary<long, bool?> _overrides = new();
-    private bool _fillingAdapters;
 
     // Quota
     private readonly CheckBox _quotaEnabled = new() { Text = "Track a monthly data quota", AutoSize = true };
@@ -45,19 +45,21 @@ internal sealed class SettingsForm : Form
 
     // Connectivity
     private readonly CheckBox _outageLog = new() { Text = "Log internet outages", AutoSize = true };
-    private readonly TextBox _probeUrl = new() { Width = 380 };
-    private readonly TextBox _probeExpect = new() { Width = 380 };
+    private readonly TextBox _probeUrl = new();
+    private readonly TextBox _probeExpect = new();
     private readonly NumericUpDown _probeInterval = Number(10, 3600);
 
     // Data
     private readonly CheckBox _appTracking = new() { Text = "Record usage per app", AutoSize = true };
     private readonly NumericUpDown _retention = Number(1, 366);
     private readonly Label _serviceState = new() { AutoSize = true, MaximumSize = new Size(520, 0) };
+    private readonly Button _undo = new() { Text = "Undo last restore", AutoSize = true };
 
     private readonly List<Control> _serviceControls = new();
     private ServiceSettings? _service;
     private List<AdapterInfo> _adapters = [];
     private Font _widgetFont;
+    private bool _applying;
 
     public SettingsForm(LedgerClient client, BackupFlow backup, UiSettings current)
     {
@@ -67,7 +69,6 @@ internal sealed class SettingsForm : Form
         _widgetFont = new Font(_edit.FontFamily, _edit.FontSize);
         Text = "NetLedger settings";
         Icon = TrayApp.AppIcon;
-        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 9f);
         Size = new Size(Px(640), Px(560));
@@ -85,8 +86,6 @@ internal sealed class SettingsForm : Form
     /// <summary>Raised after service settings or adapter choices were changed.</summary>
     public event Action? ServiceSettingsApplied;
 
-    private int Px(int logical) => (int)Math.Round(logical * DeviceDpi / 96.0);
-
     private static ComboBox Combo(params string[] items)
     {
         var box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
@@ -102,7 +101,7 @@ internal sealed class SettingsForm : Form
         Control[] fixedWidth =
         [
             _units, _smoothing, _sizeBase, _weekStart, _placement, _graphWidth, _graphSeconds, _gap,
-            _quotaAmount, _quotaUnit, _cycleDay, _alerts, _probeUrl, _probeExpect, _probeInterval, _retention,
+            _quotaAmount, _quotaUnit, _cycleDay, _alerts, _probeInterval, _retention,
         ];
         foreach (Control control in fixedWidth)
         {
@@ -116,7 +115,10 @@ internal sealed class SettingsForm : Form
 
     private void BuildLayout()
     {
-        _tabs.Dock = DockStyle.Fill;
+        _pageStrip.Dock = DockStyle.Top;
+        _pageStrip.AutoSize = true;
+        _pageStrip.Padding = new Padding(Px(10), Px(10), Px(10), Px(2));
+        _pageHost.Dock = DockStyle.Fill;
 
         TableLayoutPanel general = Page("General");
         AddRow(general, null, _startup);
@@ -139,7 +141,7 @@ internal sealed class SettingsForm : Form
         _downloadColor.Click += (_, _) => PickColor(_downloadColor);
         _font.Click += (_, _) => PickFont();
 
-        TabPage adapters = new("Adapters") { Padding = new Padding(Px(12)) };
+        Panel adapters = AddPage("Adapters");
         var adapterHelp = new Label
         {
             Dock = DockStyle.Top,
@@ -156,36 +158,29 @@ internal sealed class SettingsForm : Form
         _adapterList.Columns.Add("Description", Px(210));
         _adapterList.Columns.Add("Type", Px(80));
         _adapterList.Columns.Add("Choice", Px(80));
+        // The list also raises check events by itself (for instance when its handle is created the first time the
+        // tab is shown), so the events only refresh the label; the choice is read from the ticks on Apply.
         _adapterList.ItemChecked += (_, e) =>
         {
-            // The list re-raises check events for every item when its handle is created (first time the tab
-            // is shown), so only a state that differs from the current choice counts as the user's doing.
-            if (_fillingAdapters || e.Item.Tag is not long id || _adapters.FirstOrDefault(a => a.Id == id) is not { } adapter)
+            if (e.Item.SubItems.Count > 3 && AdapterFor(e.Item) is { } adapter)
             {
-                return;
-            }
-
-            bool current = _overrides.GetValueOrDefault(id) ?? IfTable.CountsByDefault(adapter.IsHardware, adapter.IfType);
-            if (e.Item.Checked != current)
-            {
-                _overrides[id] = e.Item.Checked;
-                e.Item.SubItems[3].Text = "Manual";
+                e.Item.SubItems[3].Text = e.Item.Checked == AutomaticChoice(adapter) ? "Automatic" : "Manual";
             }
         };
         var automatic = new Button { Text = "Use the automatic choice for all", AutoSize = true, Dock = DockStyle.Bottom };
         automatic.Click += (_, _) =>
         {
-            foreach (long id in _overrides.Keys.ToList())
+            foreach (ListViewItem item in _adapterList.Items)
             {
-                _overrides[id] = null;
+                if (AdapterFor(item) is { } adapter)
+                {
+                    item.Checked = AutomaticChoice(adapter);
+                }
             }
-
-            FillAdapters();
         };
         adapters.Controls.Add(_adapterList);
         adapters.Controls.Add(automatic);
         adapters.Controls.Add(adapterHelp);
-        _tabs.TabPages.Add(adapters);
         _serviceControls.AddRange([_adapterList, automatic]);
 
         TableLayoutPanel quota = Page("Quota");
@@ -201,8 +196,8 @@ internal sealed class SettingsForm : Form
 
         TableLayoutPanel connectivity = Page("Connectivity");
         AddRow(connectivity, null, _outageLog);
-        AddRow(connectivity, "Check address", _probeUrl);
-        AddRow(connectivity, "Expected text", _probeExpect);
+        AddRow(connectivity, "Check address", _probeUrl, stretch: true);
+        AddRow(connectivity, "Expected text", _probeExpect, stretch: true);
         AddRow(connectivity, "Check every", WithSuffix(_probeInterval, "seconds (every 10 s while offline)"));
         AddRow(connectivity, null, Note("The check is one tiny web request, by default to the address Windows itself uses to decide "
                                         + "whether you're online. Two failures in a row count as an outage."));
@@ -214,16 +209,23 @@ internal sealed class SettingsForm : Form
         var backupButtons = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Margin = Padding.Empty };
         var export = new Button { Text = "Back up data…", AutoSize = true };
         var import = new Button { Text = "Restore from backup…", AutoSize = true };
-        var undo = new Button { Text = "Undo last restore", AutoSize = true };
         export.Click += async (_, _) => await _backup.ExportAsync(this);
-        import.Click += async (_, _) => await _backup.ImportAsync(this);
-        undo.Click += async (_, _) => await _backup.UndoAsync(this);
-        backupButtons.Controls.AddRange([export, import, undo]);
+        import.Click += async (_, _) =>
+        {
+            await _backup.ImportAsync(this);
+            await RefreshUndoAsync();
+        };
+        _undo.Click += async (_, _) =>
+        {
+            await _backup.UndoAsync(this);
+            await RefreshUndoAsync();
+        };
+        backupButtons.Controls.AddRange([export, import, _undo]);
         AddRow(data, "Backups", backupButtons);
         AddRow(data, null, Note("Restoring replaces any hours that are in both the backup and this PC's history. "
                                 + "A snapshot is taken first, so a restore can be undone."));
         AddRow(data, "Service", _serviceState);
-        _serviceControls.AddRange([_appTracking, _retention, export, import, undo]);
+        _serviceControls.AddRange([_appTracking, _retention, export, import, _undo]);
 
         var buttons = new FlowLayoutPanel
         {
@@ -248,13 +250,41 @@ internal sealed class SettingsForm : Form
         AcceptButton = ok;
         CancelButton = cancel;
 
-        Controls.Add(_tabs);
+        // Fill first, then the edges: the last control added docks outermost.
+        Controls.Add(_pageHost);
         Controls.Add(buttons);
+        Controls.Add(_pageStrip);
+    }
+
+    private Panel AddPage(string title)
+    {
+        bool first = _pages.Count == 0;
+        var page = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(Px(12)), Visible = first };
+        var button = new NavButton(title)
+        {
+            Checked = first,
+            Margin = new Padding(0, 0, Px(4), 0),
+            Padding = new Padding(Px(8), Px(3), Px(8), Px(3)),
+        };
+        button.CheckedChanged += (_, _) =>
+        {
+            if (button.Checked)
+            {
+                foreach ((_, Panel other) in _pages)
+                {
+                    other.Visible = other == page;
+                }
+            }
+        };
+        _pageStrip.Controls.Add(button);
+        _pageHost.Controls.Add(page);
+        _pages.Add((button, page));
+        return page;
     }
 
     private TableLayoutPanel Page(string title)
     {
-        var page = new TabPage(title) { Padding = new Padding(Px(12)), AutoScroll = true };
+        Panel page = AddPage(title);
         var table = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -265,15 +295,20 @@ internal sealed class SettingsForm : Form
         table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         page.Controls.Add(table);
-        _tabs.TabPages.Add(page);
         return table;
     }
 
-    private void AddRow(TableLayoutPanel table, string? label, Control control)
+    /// <param name="stretch">Fill the rest of the row (long text such as addresses) instead of keeping a fixed width.</param>
+    private void AddRow(TableLayoutPanel table, string? label, Control control, bool stretch = false)
     {
         int row = table.RowCount++;
         table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         control.Margin = new Padding(Px(4), Px(5), Px(4), Px(5));
+        if (stretch)
+        {
+            control.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        }
+
         if (label is null)
         {
             table.Controls.Add(control, 0, row);
@@ -330,6 +365,7 @@ internal sealed class SettingsForm : Form
 
     private async Task LoadServiceAsync()
     {
+        bool canUndo = false;
         try
         {
             IpcResponse settings = await _client.CallAsync(Ops.GetSettings);
@@ -338,8 +374,9 @@ internal sealed class SettingsForm : Form
             _service = settings.Settings;
             _adapters = adapters.Adapters ?? [];
             ServiceStatus s = status.Status!;
+            canUndo = s.CanUndoImport;
             _serviceState.Text = $"Running, version {s.Version}.{Environment.NewLine}"
-                                 +(s.AppTracking ? "Per-app tracking is on." : s.AppTrackingError ?? "Per-app tracking is off.")
+                                 + (s.AppTracking ? "Per-app tracking is on." : s.AppTrackingError ?? "Per-app tracking is off.")
                                  + (s.EventsLost > 0 ? $" {s.EventsLost:N0} network events were dropped under load." : "");
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException)
@@ -354,6 +391,7 @@ internal sealed class SettingsForm : Form
             control.Enabled = _service is not null;
         }
 
+        _undo.Enabled = _service is not null && canUndo;
         if (_service is null)
         {
             return;
@@ -361,19 +399,20 @@ internal sealed class SettingsForm : Form
 
         QuotaSettings quota = _service.Quota;
         _quotaEnabled.Checked = quota.Enabled;
-        if (quota.Enabled)
+        if (!quota.Enabled && quota.LimitBytes == new QuotaSettings().LimitBytes)
         {
-            long tb = ByteFormat.UnitBytes(4);
-            bool useTb = quota.LimitBytes >= tb && quota.LimitBytes % (tb / 100) == 0;
-            _quotaUnit.SelectedIndex = useTb ? 1 : 0;
-            _quotaAmount.Value = Math.Clamp(Math.Round((decimal)quota.LimitBytes / ByteFormat.UnitBytes(useTb ? 4 : 3), 2), _quotaAmount.Minimum, _quotaAmount.Maximum);
-        }
-        else
-        {
-            // Nothing set up yet: offer a round number in whichever units are in use.
+            // Never set up: offer a round number in whichever units are in use.
             _quotaUnit.SelectedIndex = 1;
             _quotaAmount.Value = 1;
         }
+        else
+        {
+            decimal terabytes = (decimal)quota.LimitBytes / ByteFormat.UnitBytes(4);
+            bool useTb = terabytes >= 1 && Math.Round(terabytes, 2) == Math.Round(terabytes, 6);
+            _quotaUnit.SelectedIndex = useTb ? 1 : 0;
+            _quotaAmount.Value = Math.Clamp(Math.Round((decimal)quota.LimitBytes / ByteFormat.UnitBytes(useTb ? 4 : 3), 2), _quotaAmount.Minimum, _quotaAmount.Maximum);
+        }
+
         _cycleDay.Value = quota.CycleStartDay;
         _countUpload.Checked = quota.CountUpload;
         _alerts.Text = string.Join(", ", quota.AlertPercents);
@@ -383,27 +422,40 @@ internal sealed class SettingsForm : Form
         _probeInterval.Value = Math.Clamp(_service.ProbeIntervalSeconds, 10, 3600);
         _appTracking.Checked = _service.AppTracking;
         _retention.Value = Math.Clamp(_service.MinuteRetentionDays, 1, 366);
-        foreach (AdapterInfo adapter in _adapters)
-        {
-            _overrides[adapter.Id] = adapter.CountsOverride;
-        }
-
         FillAdapters();
     }
 
+    private async Task RefreshUndoAsync()
+    {
+        try
+        {
+            _undo.Enabled = (await _client.CallAsync(Ops.Status)).Status?.CanUndoImport == true;
+        }
+        catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException)
+        {
+            _undo.Enabled = false;
+        }
+    }
+
+    private AdapterInfo? AdapterFor(ListViewItem item) =>
+        item.Tag is long id ? _adapters.FirstOrDefault(a => a.Id == id) : null;
+
+    private static bool AutomaticChoice(AdapterInfo adapter) => IfTable.CountsByDefault(adapter.IsHardware, adapter.IfType);
+
     private void FillAdapters()
     {
-        _fillingAdapters = true;
         _adapterList.BeginUpdate();
         _adapterList.Items.Clear();
         foreach (AdapterInfo adapter in _adapters)
         {
-            bool? choice = _overrides.GetValueOrDefault(adapter.Id);
-            bool counts = choice ?? IfTable.CountsByDefault(adapter.IsHardware, adapter.IfType);
-            var item = new ListViewItem(adapter.Present ? adapter.Name : $"{adapter.Name} (not present)") { Tag = adapter.Id, Checked = counts };
+            bool counts = adapter.CountsOverride ?? AutomaticChoice(adapter);
+            string name = adapter.Present ? adapter.Name
+                : adapter.LastSeenUtc > 0 ? $"{adapter.Name} (last seen {DateTimeOffset.FromUnixTimeSeconds(adapter.LastSeenUtc).LocalDateTime.ToString("d MMM yyyy", CultureInfo.CurrentCulture)})"
+                : $"{adapter.Name} (not present)";
+            var item = new ListViewItem(name) { Tag = adapter.Id, Checked = counts };
             item.SubItems.Add(adapter.Description);
             item.SubItems.Add(adapter.IsHardware ? IfTable.DescribeType(adapter.IfType) : "Virtual");
-            item.SubItems.Add(choice is null ? "Automatic" : "Manual");
+            item.SubItems.Add(counts == AutomaticChoice(adapter) ? "Automatic" : "Manual");
             if (!adapter.Present)
             {
                 item.ForeColor = Theme.Current.SubtleText;
@@ -413,7 +465,6 @@ internal sealed class SettingsForm : Form
         }
 
         _adapterList.EndUpdate();
-        _fillingAdapters = false;
     }
 
     // ---- pickers ----
@@ -457,6 +508,25 @@ internal sealed class SettingsForm : Form
 
     private async Task<bool> ApplyAsync()
     {
+        // A quick double click on OK must not send everything twice.
+        if (_applying)
+        {
+            return false;
+        }
+
+        _applying = true;
+        try
+        {
+            return await ApplyCoreAsync();
+        }
+        finally
+        {
+            _applying = false;
+        }
+    }
+
+    private async Task<bool> ApplyCoreAsync()
+    {
         _edit.RateUnit = (RateUnit)_units.SelectedIndex;
         _edit.SmoothingSeconds = (int)_smoothing.Value;
         _edit.SizeBase = (SizeBase)_sizeBase.SelectedIndex;
@@ -481,7 +551,7 @@ internal sealed class SettingsForm : Form
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException or IOException)
         {
-            MessageBox.Show(this, $"Couldn't change the startup setting: {ex.Message}", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(this, $"Couldn't change the startup setting: {ex.Message}");
         }
 
         UiSettingsApplied?.Invoke(_edit.Clone());
@@ -493,7 +563,7 @@ internal sealed class SettingsForm : Form
 
         if (!TryReadServiceSettings(out ServiceSettings? updated, out string? problem))
         {
-            MessageBox.Show(this, problem, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(this, problem!);
             return false;
         }
 
@@ -501,9 +571,15 @@ internal sealed class SettingsForm : Form
         {
             await _client.CallAsync(new IpcRequest { Op = Ops.SetSettings, Settings = updated });
             _service = updated;
-            foreach (AdapterInfo adapter in _adapters)
+            foreach (ListViewItem item in _adapterList.Items)
             {
-                bool? choice = _overrides.GetValueOrDefault(adapter.Id);
+                if (AdapterFor(item) is not { } adapter)
+                {
+                    continue;
+                }
+
+                // A tick that matches the automatic rule stays automatic; only a deliberate difference is stored.
+                bool? choice = item.Checked == AutomaticChoice(adapter) ? null : item.Checked;
                 if (choice != adapter.CountsOverride)
                 {
                     await _client.CallAsync(new IpcRequest { Op = Ops.SetAdapter, Adapter = new AdapterUpdate { Id = adapter.Id, CountsOverride = choice } });
@@ -516,7 +592,7 @@ internal sealed class SettingsForm : Form
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException)
         {
-            MessageBox.Show(this, $"The service didn't accept the settings: {ex.Message}", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(this, $"The service didn't accept the settings: {ex.Message}");
             return false;
         }
     }

@@ -8,7 +8,7 @@ namespace NetLedger.Tests;
 public class CounterAndFormatTests
 {
     private static InterfaceSnapshot Nic(Guid guid, ulong received, ulong sent, ulong linkBits = 1_000_000_000) =>
-        new(guid, "Ethernet", "Test adapter", IfTable.IfTypeEthernet, true, true, linkBits, received, sent);
+        new(guid, "Ethernet", "Test adapter", IfTable.IfTypeEthernet, true, linkBits, received, sent);
 
     [Fact]
     public void FirstSampleOnlySetsBaseline()
@@ -70,5 +70,6 @@ public class CounterAndFormatTests
         Assert.Equal("423 Mbit", ByteFormat.Rate(423e6 / 8, RateUnit.AutoBits));
         Assert.Equal("1.2 Gbit", ByteFormat.Rate(1.2e9 / 8, RateUnit.AutoBits));
         Assert.Equal("0.5 Mbit", ByteFormat.Rate(0.5e6 / 8, RateUnit.Mbit));
+        Assert.Equal("1.0 Mbit", ByteFormat.Rate(999_970.0 / 8, RateUnit.AutoBits)); // not "1000 Kbit"
     }
 }

@@ -47,7 +47,7 @@ internal static class Log
 
                 File.AppendAllText(s_path, line + Environment.NewLine);
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 // Logging must never take the service down.
             }

@@ -9,7 +9,6 @@ public readonly record struct InterfaceSnapshot(
     string Description,
     uint IfType,
     bool IsHardware,
-    bool IsUp,
     ulong LinkSpeedBitsPerSecond,
     ulong InOctets,
     ulong OutOctets);
@@ -25,7 +24,6 @@ public static unsafe partial class IfTable
     private const int OffDescription = 542;
     private const int OffType = 1128;
     private const int OffFlags = 1152;
-    private const int OffOperStatus = 1156;
     private const int OffTransmitLinkSpeed = 1192;
     private const int OffReceiveLinkSpeed = 1200;
     private const int OffInOctets = 1208;
@@ -33,7 +31,6 @@ public static unsafe partial class IfTable
 
     private const byte FlagHardwareInterface = 0x01;
     private const byte FlagFilterInterface = 0x02;
-    private const int IfOperStatusUp = 1;
 
     public const uint IfTypeEthernet = 6;
     public const uint IfTypePpp = 23;
@@ -87,7 +84,6 @@ public static unsafe partial class IfTable
                     Description: new string((char*)(row + OffDescription)),
                     IfType: type,
                     IsHardware: (flags & FlagHardwareInterface) != 0,
-                    IsUp: *(int*)(row + OffOperStatus) == IfOperStatusUp,
                     LinkSpeedBitsPerSecond: Math.Max(tx == ulong.MaxValue ? 0 : tx, rx == ulong.MaxValue ? 0 : rx),
                     InOctets: *(ulong*)(row + OffInOctets),
                     OutOctets: *(ulong*)(row + OffOutOctets)));

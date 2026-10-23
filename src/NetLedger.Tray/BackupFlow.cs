@@ -12,7 +12,6 @@ namespace NetLedger.Tray;
 internal sealed class BackupFlow(LedgerClient client)
 {
     private static readonly TimeSpan LongCall = TimeSpan.FromMinutes(5);
-    private const string Title = "NetLedger";
     private const string Filter = "NetLedger backup (*.netledger)|*.netledger|All files (*.*)|*.*";
 
     /// <summary>Raised after a restore or undo changed the history.</summary>
@@ -35,18 +34,20 @@ internal sealed class BackupFlow(LedgerClient client)
 
         try
         {
-            using var busy = new BusyCursor();
-            IpcResponse response = await client.CallAsync(new IpcRequest { Op = Ops.Export }, LongCall);
-            BackupData data = response.Backup ?? throw new ServiceRequestException("The service returned no data.");
-            await Task.Run(() => BackupFile.Write(dialog.FileName, data));
-            busy.Dispose();
-            MessageBox.Show(owner,
-                $"Saved {data.Hours.Select(h => h.Time).Distinct().Count():N0} hours of history, {data.AppHours.Count:N0} per-app records and {data.Outages.Count:N0} outages to\n{dialog.FileName}",
-                Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            BackupData data;
+            using (new BusyCursor())
+            {
+                IpcResponse response = await client.CallAsync(new IpcRequest { Op = Ops.Export }, LongCall);
+                data = response.Backup ?? throw new ServiceRequestException("The service returned no data.");
+                await Task.Run(() => BackupFile.Write(dialog.FileName, data));
+            }
+
+            Dialogs.Info(owner,
+                $"Saved {data.Hours.Select(h => h.Time).Distinct().Count():N0} hours of history, {data.AppHours.Count:N0} per-app records and {data.Outages.Count:N0} outages to\n{dialog.FileName}");
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException or IOException or UnauthorizedAccessException)
         {
-            MessageBox.Show(owner, $"The backup failed: {ex.Message}", Title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(owner, $"The backup failed: {ex.Message}");
         }
     }
 
@@ -85,7 +86,7 @@ internal sealed class BackupFlow(LedgerClient client)
                 + $"It covers {range}: {preview.HourCount:N0} hours, ↓ {ByteFormat.Size(preview.Received)} ↑ {ByteFormat.Size(preview.Sent)}, "
                 + $"{preview.AppRows:N0} per-app records and {preview.Outages:N0} outages.\n\n{overlap}\n\n"
                 + "A snapshot of the current history is taken first, so you can undo this. Restore now?";
-            if (MessageBox.Show(owner, message, Title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            if (!Dialogs.Confirm(owner, message))
             {
                 return;
             }
@@ -98,22 +99,20 @@ internal sealed class BackupFlow(LedgerClient client)
             }
 
             HistoryChanged?.Invoke();
-            MessageBox.Show(owner,
-                $"Restored {result.RowsImported:N0} records ({result.HoursReplaced:N0} hours). Use \"Undo last restore\" in Settings → Data to go back.",
-                Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Dialogs.Info(owner,
+                $"Restored {result.RowsImported:N0} records ({result.HoursReplaced:N0} hours). Use \"Undo last restore\" in Settings → Data to go back.");
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException or IOException
                                        or UnauthorizedAccessException or InvalidDataException or JsonException)
         {
-            MessageBox.Show(owner, $"The restore failed: {ex.Message}", Title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(owner, $"The restore failed: {ex.Message}");
         }
     }
 
     public async Task UndoAsync(IWin32Window? owner)
     {
-        if (MessageBox.Show(owner,
-                "Put the history back the way it was before the last restore? Anything recorded since that restore is lost.",
-                Title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+        if (!Dialogs.Confirm(owner,
+                "Put the history back the way it was before the last restore? Anything recorded since that restore is lost."))
         {
             return;
         }
@@ -126,11 +125,11 @@ internal sealed class BackupFlow(LedgerClient client)
             }
 
             HistoryChanged?.Invoke();
-            MessageBox.Show(owner, "The last restore was undone.", Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Dialogs.Info(owner, "The last restore was undone.");
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceRequestException)
         {
-            MessageBox.Show(owner, ex.Message, Title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Dialogs.Warn(owner, ex.Message);
         }
     }
 

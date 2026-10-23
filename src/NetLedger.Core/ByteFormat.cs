@@ -52,25 +52,28 @@ public static class ByteFormat
         _ => Number(88.8) + " MB/s",
     };
 
+    // Thresholds sit just below 1000 of a unit so values never round up to "1000 Kbit".
+    private const double RoundsToThousand = 999.95;
+
     private static string AutoBits(double bits)
     {
-        if (bits < 1e6)
+        if (bits < RoundsToThousand * 1e3)
         {
             return Number(bits / 1e3) + " Kbit";
         }
 
-        return bits < 1e9 ? Number(bits / 1e6) + " Mbit" : Number(bits / 1e9) + " Gbit";
+        return bits < RoundsToThousand * 1e6 ? Number(bits / 1e6) + " Mbit" : Number(bits / 1e9) + " Gbit";
     }
 
     private static string AutoBytes(double bytes)
     {
         double step = Step;
-        if (bytes < step * step)
+        if (bytes < RoundsToThousand * step)
         {
             return Number(bytes / step) + " KB/s";
         }
 
-        return bytes < step * step * step
+        return bytes < RoundsToThousand * step * step
             ? Number(bytes / (step * step)) + " MB/s"
             : Number(bytes / (step * step * step)) + " GB/s";
     }

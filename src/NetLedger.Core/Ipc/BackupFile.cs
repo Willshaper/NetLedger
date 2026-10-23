@@ -12,15 +12,23 @@ public static class BackupFile
     public static void Write(string path, BackupData data)
     {
         string temp = path + ".tmp";
-        using (FileStream file = File.Create(temp))
-        using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
+        try
         {
-            ZipArchiveEntry entry = zip.CreateEntry(EntryName, CompressionLevel.SmallestSize);
-            using Stream stream = entry.Open();
-            JsonSerializer.Serialize(stream, data, LedgerJson.Default.BackupData);
-        }
+            using (FileStream file = File.Create(temp))
+            using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
+            {
+                ZipArchiveEntry entry = zip.CreateEntry(EntryName, CompressionLevel.SmallestSize);
+                using Stream stream = entry.Open();
+                JsonSerializer.Serialize(stream, data, LedgerJson.Default.BackupData);
+            }
 
-        File.Move(temp, path, overwrite: true);
+            File.Move(temp, path, overwrite: true);
+        }
+        catch
+        {
+            File.Delete(temp);
+            throw;
+        }
     }
 
     public static BackupData Read(string path)

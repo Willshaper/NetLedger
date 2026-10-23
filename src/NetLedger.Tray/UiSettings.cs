@@ -82,6 +82,11 @@ internal sealed class UiSettings
 
     private void Clamp()
     {
+        // A hand-edited file can hold numbers that aren't valid choices.
+        RateUnit = Enum.IsDefined(RateUnit) ? RateUnit : RateUnit.AutoBits;
+        SizeBase = Enum.IsDefined(SizeBase) ? SizeBase : SizeBase.Binary;
+        WeekStart = Enum.IsDefined(WeekStart) ? WeekStart : DayOfWeek.Monday;
+        Placement = Enum.IsDefined(Placement) ? Placement : WidgetPlacement.Embedded;
         SmoothingSeconds = Math.Clamp(SmoothingSeconds, 1, 10);
         GraphWidth = Math.Clamp(GraphWidth, 20, 200);
         GraphSeconds = Math.Clamp(GraphSeconds, 20, 600);

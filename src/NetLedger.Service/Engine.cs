@@ -19,8 +19,8 @@ namespace NetLedger.Service;
 /// </summary>
 internal sealed class Engine : IDisposable
 {
-    private const int FlushIntervalSeconds = 60;
-    private const int MaintenanceIntervalSeconds = 3600;
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromHours(1);
     private const int MaxBuckets = 200_000;
     private const int SnapshotsKept = 5;
     private const string SettingsKey = "settings";
@@ -30,6 +30,7 @@ internal sealed class Engine : IDisposable
     private readonly string _dataDirectory;
     private readonly bool _secureDataDirectory;
     private readonly object _sync = new();
+    private readonly object _connectivityGate = new();
     private readonly CounterTracker _counters = new();
     private readonly List<InterfaceSnapshot> _snapshots = new();
     private readonly List<InterfaceDelta> _deltas = new();
@@ -43,15 +44,19 @@ internal sealed class Engine : IDisposable
 
     private Database _db = null!;
     private Dictionary<string, long> _appIds = new();
+
+    // Apps whose stored name and path were brought up to date this session (the path is used for the icon).
+    private readonly HashSet<string> _appsRefreshed = new(StringComparer.Ordinal);
     private ServiceSettings _settings = new();
     private EtwNetworkSession? _etw;
     private string? _etwError;
     private ConnectivityMonitor? _connectivity;
     private PipeServer? _pipe;
     private Task? _loop;
-    private long _startedUtc;
-    private long _lastFlushUtc;
-    private long _lastMaintenanceUtc;
+
+    // Stopwatch timestamps, so a clock change can't stall flushing or maintenance.
+    private long _lastFlush;
+    private long _lastMaintenance;
     private bool _suspended;
     private int _ticksWhileSuspended;
 
@@ -76,12 +81,12 @@ internal sealed class Engine : IDisposable
         {
             _db = new Database(Path.Combine(_dataDirectory, "netledger.db"));
             _settings = LoadSettings();
+            TidyStoredRecords();
             ReloadCaches();
             _db.CloseDanglingOutages();
-            _startedUtc = NowUtc;
-            _lastFlushUtc = _startedUtc;
-            _lastMaintenanceUtc = 0;
+            _lastFlush = Stopwatch.GetTimestamp();
             ApplyAppTracking();
+            Maintenance();
         }
 
         ApplyConnectivity();
@@ -105,9 +110,7 @@ internal sealed class Engine : IDisposable
         _connectivity?.Dispose();
         lock (_sync)
         {
-            _etw?.Dispose();
-            _etw = null;
-            DrainAppTraffic(NowUtc);
+            StopAppTracking();
             FlushLocked(NowUtc);
             _db?.Dispose();
         }
@@ -215,20 +218,36 @@ internal sealed class Engine : IDisposable
 
         DrainAppTraffic(now);
 
-        if (now - _lastFlushUtc >= FlushIntervalSeconds)
+        if (Stopwatch.GetElapsedTime(_lastFlush) >= FlushInterval)
         {
             FlushLocked(now);
+            if (_etw is { IsRunning: false })
+            {
+                Log.Warn("The per-app trace session ended unexpectedly; restarting it.");
+                StopAppTracking();
+                ApplyAppTracking();
+            }
         }
 
-        if (now - _lastMaintenanceUtc >= MaintenanceIntervalSeconds)
+        if (Stopwatch.GetElapsedTime(_lastMaintenance) >= MaintenanceInterval)
         {
-            Maintenance(now);
+            Maintenance();
         }
     }
 
     private AdapterRecord EnsureAdapter(InterfaceSnapshot snapshot, long now)
     {
-        if (!_adapters.TryGetValue(snapshot.Guid, out AdapterRecord? adapter))
+        if (!_adapters.TryGetValue(snapshot.Guid, out AdapterRecord? adapter)
+            && _adapters.Values.FirstOrDefault(a => !_present.Contains(a.Guid) && a.SameAdapterAs(snapshot)) is { } previous)
+        {
+            // A VPN tunnel or virtual switch that came back with a new GUID: carry on with its existing record, so
+            // its history and counting choice stay in one place. The new GUID is saved at the next flush.
+            _adapters.Remove(previous.Guid);
+            _touchedAdapters.Remove(previous.Guid);
+            adapter = previous with { Guid = snapshot.Guid, LastSeenUtc = now };
+            _adapters[snapshot.Guid] = adapter;
+        }
+        else if (adapter is null)
         {
             adapter = _db.AddAdapter(snapshot.Guid, snapshot.Alias, snapshot.Description, snapshot.IfType, snapshot.IsHardware, null, now);
             _adapters[snapshot.Guid] = adapter;
@@ -258,6 +277,12 @@ internal sealed class Engine : IDisposable
             {
                 appId = _db.AddApp(app.Key, app.Name, app.Path);
                 _appIds[app.Key] = appId;
+                _appsRefreshed.Add(app.Key);
+            }
+            else if (_appsRefreshed.Add(app.Key))
+            {
+                // The app may have updated into a new folder since it was stored; keep the icon path current.
+                _db.UpdateApp(appId, app.Name, app.Path);
             }
 
             _pending.AddApp(now, appId, entry.Value.Received, entry.Value.Sent);
@@ -266,7 +291,7 @@ internal sealed class Engine : IDisposable
 
     private void FlushLocked(long now)
     {
-        _lastFlushUtc = now;
+        _lastFlush = Stopwatch.GetTimestamp();
         if (_pending.IsEmpty && _touchedAdapters.Count == 0)
         {
             return;
@@ -285,12 +310,12 @@ internal sealed class Engine : IDisposable
         }
     }
 
-    private void Maintenance(long now)
+    private void Maintenance()
     {
-        _lastMaintenanceUtc = now;
+        _lastMaintenance = Stopwatch.GetTimestamp();
         try
         {
-            int pruned = _db.PruneMinutes(now - (long)_settings.MinuteRetentionDays * 86400);
+            int pruned = _db.PruneMinutes(NowUtc - (long)_settings.MinuteRetentionDays * 86400);
             if (pruned > 0)
             {
                 Log.Info($"Pruned {pruned} minute rows.");
@@ -305,6 +330,36 @@ internal sealed class Engine : IDisposable
         }
     }
 
+    // Brings records stored by earlier versions (or restored from their backups) in line with how they're made now.
+    // A failure here only leaves duplicates in the lists, so it is logged rather than allowed to stop the service.
+    private void TidyStoredRecords()
+    {
+        try
+        {
+            int adapters = _db.MergeDuplicateAdapters();
+            if (adapters > 0)
+            {
+                Log.Info($"Merged {adapters} duplicate adapter records (VPN or virtual adapters that came back with a new GUID).");
+            }
+
+            int apps = _db.MergeDuplicateApps();
+            if (apps > 0)
+            {
+                Log.Info($"Merged {apps} duplicate app records (apps that updated into a new folder, or per-user services from earlier sign-ins).");
+            }
+
+            int renamed = _db.RenameServiceApps();
+            if (renamed > 0)
+            {
+                Log.Info($"Gave {renamed} Windows services their English names.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Tidying stored adapters and apps failed", ex);
+        }
+    }
+
     private void ReloadCaches()
     {
         _adapters.Clear();
@@ -314,6 +369,7 @@ internal sealed class Engine : IDisposable
         }
 
         _appIds = _db.LoadAppIds();
+        _appsRefreshed.Clear();
     }
 
     // ---- settings ----
@@ -328,9 +384,11 @@ internal sealed class Engine : IDisposable
 
         try
         {
-            return JsonSerializer.Deserialize(json, LedgerJson.Default.ServiceSettings) ?? new ServiceSettings();
+            ServiceSettings settings = JsonSerializer.Deserialize(json, LedgerJson.Default.ServiceSettings) ?? new ServiceSettings();
+            Validate(settings);
+            return settings;
         }
-        catch (JsonException ex)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
             Log.Warn($"Settings unreadable, using defaults: {ex.Message}");
             return new ServiceSettings();
@@ -360,15 +418,34 @@ internal sealed class Engine : IDisposable
         }
         else if (!_settings.AppTracking && _etw is not null)
         {
-            DrainAppTraffic(NowUtc);
-            _etw.Dispose();
-            _etw = null;
+            StopAppTracking();
             Log.Info("Per-app tracking stopped.");
         }
     }
 
+    // Stopping the session first means the final drain catches every event it delivered.
+    private void StopAppTracking()
+    {
+        if (_etw is null)
+        {
+            return;
+        }
+
+        _etw.Dispose();
+        DrainAppTraffic(NowUtc);
+        _etw = null;
+    }
+
     // Called outside _sync: the monitor's events take _sync themselves.
     private void ApplyConnectivity()
+    {
+        lock (_connectivityGate)
+        {
+            ApplyConnectivityCore();
+        }
+    }
+
+    private void ApplyConnectivityCore()
     {
         ServiceSettings settings;
         lock (_sync)
@@ -424,12 +501,13 @@ internal sealed class Engine : IDisposable
             }
         }
 
+        Require(settings.ProbeUrl is not null && settings.ProbeExpect is not null && settings.Quota?.AlertPercents is not null,
+            "The settings are incomplete.");
         Require(settings.MinuteRetentionDays is >= 1 and <= 366, "Minute retention must be 1–366 days.");
         Require(settings.ProbeIntervalSeconds is >= 10 and <= 3600, "The probe interval must be 10–3600 seconds.");
         Require(Uri.TryCreate(settings.ProbeUrl, UriKind.Absolute, out Uri? uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps),
             "The probe URL must be an http(s) address.");
-        Require(settings.ProbeExpect.Length <= 200, "The expected probe text is too long.");
-        Require(settings.Quota is not null, "Quota settings are missing.");
+        Require(settings.ProbeExpect!.Length <= 200, "The expected probe text is too long.");
         Require(settings.Quota!.LimitBytes > 0, "The quota must be larger than zero.");
         Require(settings.Quota.CycleStartDay is >= 1 and <= 31, "The billing day must be 1–31.");
         Require(settings.Quota.AlertPercents.Count <= 10 && settings.Quota.AlertPercents.All(p => p is >= 1 and <= 1000),
@@ -447,6 +525,12 @@ internal sealed class Engine : IDisposable
             Validate(settings);
             lock (_sync)
             {
+                if (QuotaChanged(_settings.Quota, settings.Quota))
+                {
+                    // Alerts already shown for the old quota say nothing about the new one.
+                    _db.SetMeta(QuotaNotifiedKey, null);
+                }
+
                 _settings = settings;
                 _db.SetMeta(SettingsKey, JsonSerializer.Serialize(settings, LedgerJson.Default.ServiceSettings));
                 ApplyAppTracking();
@@ -478,10 +562,13 @@ internal sealed class Engine : IDisposable
         }
     }
 
+    private static bool QuotaChanged(QuotaSettings old, QuotaSettings updated) =>
+        old.Enabled != updated.Enabled || old.LimitBytes != updated.LimitBytes || old.CycleStartDay != updated.CycleStartDay
+        || old.CountUpload != updated.CountUpload || !old.AlertPercents.SequenceEqual(updated.AlertPercents);
+
     private ServiceStatus BuildStatus() => new()
     {
         Version = _version,
-        StartedUtc = _startedUtc,
         AppTracking = _etw is not null,
         AppTrackingError = _settings.AppTracking ? _etwError : null,
         EventsLost = _etw?.EventsLost() ?? 0,
@@ -667,13 +754,20 @@ internal sealed class Engine : IDisposable
         FlushLocked(NowUtc);
 
         Directory.CreateDirectory(SnapshotDirectory);
-        string name = $"pre-import-{DateTime.Now:yyyyMMdd-HHmmss}.db";
+        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+        string name = $"pre-import-{stamp}.db";
+        for (int i = 2; File.Exists(Path.Combine(SnapshotDirectory, name)); i++)
+        {
+            name = $"pre-import-{stamp}-{i}.db";
+        }
+
         string path = Path.Combine(SnapshotDirectory, name);
         _db.SnapshotTo(path);
         PruneSnapshots();
 
         ImportResult result = _db.Import(data);
         _db.SetMeta(LastImportSnapshotKey, name);
+        TidyStoredRecords();
         ReloadCaches();
         Log.Info($"Imported backup from {data.MachineName ?? "unknown machine"}: {result.HoursReplaced} hours, {result.RowsImported} rows. Snapshot {name}.");
         return new IpcResponse { Ok = true, Import = result };
@@ -693,6 +787,7 @@ internal sealed class Engine : IDisposable
         _touchedAdapters.Clear();
         _db.RestoreFrom(path);
         _db.SetMeta(LastImportSnapshotKey, null);
+        TidyStoredRecords(); // the snapshot may come from a version that stored duplicates
         ReloadCaches();
         Log.Info($"Undid the last import by restoring {name}.");
         return IpcResponse.Success();

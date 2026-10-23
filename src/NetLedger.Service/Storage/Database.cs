@@ -17,6 +17,13 @@ internal sealed record AdapterRecord(
     long LastSeenUtc)
 {
     public bool CountsInTotal => CountsOverride ?? IfTable.CountsByDefault(IsHardware, IfType);
+
+    /// <summary>
+    /// Whether an interface is this adapter apart from its GUID. VPN tunnels (WireGuard, OpenVPN) and Hyper-V/WSL
+    /// switches are created afresh, with a new GUID, every time they connect or start.
+    /// </summary>
+    public bool SameAdapterAs(InterfaceSnapshot snapshot) =>
+        Name == snapshot.Alias && Description == snapshot.Description && IfType == snapshot.IfType && IsHardware == snapshot.IsHardware;
 }
 
 /// <summary>
@@ -167,14 +174,121 @@ internal sealed class Database : IDisposable
     {
         using SqliteCommand cmd = Command(
             """
-            UPDATE adapters SET name = $n, description = $d, if_type = $t, is_hardware = $h,
+            UPDATE adapters SET guid = $g, name = $n, description = $d, if_type = $t, is_hardware = $h,
                 counts_override = $c, last_seen = $s WHERE id = $id
             """,
-            ("$id", adapter.Id), ("$n", adapter.Name), ("$d", adapter.Description), ("$t", (long)adapter.IfType),
+            ("$id", adapter.Id), ("$g", adapter.Guid.ToString()), ("$n", adapter.Name), ("$d", adapter.Description), ("$t", (long)adapter.IfType),
             ("$h", adapter.IsHardware ? 1L : 0L),
             ("$c", adapter.CountsOverride is null ? DBNull.Value : adapter.CountsOverride.Value ? 1L : 0L),
             ("$s", adapter.LastSeenUtc));
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Folds adapters that differ only in GUID into one record each, adding their usage together. Earlier versions
+    /// added a new adapter every time a VPN tunnel or virtual switch came back with a new GUID.
+    /// The most recently seen record survives. Returns how many records were folded away.
+    /// </summary>
+    public int MergeDuplicateAdapters()
+    {
+        List<IGrouping<(string, string, uint, bool), AdapterRecord>> groups = LoadAdapters()
+            .GroupBy(a => (a.Name, a.Description, a.IfType, a.IsHardware))
+            .Where(g => g.Count() > 1)
+            .ToList();
+        if (groups.Count == 0)
+        {
+            return 0;
+        }
+
+        int merged = 0;
+        InTransaction(tx =>
+        {
+            foreach (IGrouping<(string, string, uint, bool), AdapterRecord> group in groups)
+            {
+                AdapterRecord keep = group.MaxBy(a => (a.LastSeenUtc, a.Id))!;
+                foreach (AdapterRecord duplicate in group.Where(a => a.Id != keep.Id))
+                {
+                    MoveUsage("usage_hour", "hour", "adapter_id", duplicate.Id, keep.Id);
+                    MoveUsage("usage_minute", "minute", "adapter_id", duplicate.Id, keep.Id);
+                    using SqliteCommand delete = Command("DELETE FROM adapters WHERE id = $id", ("$id", duplicate.Id));
+                    delete.ExecuteNonQuery();
+                    merged++;
+                }
+
+                // Keep the user's most recent counting choice for the adapter, wherever it was made.
+                bool? choice = group.OrderByDescending(a => (a.LastSeenUtc, a.Id)).Select(a => a.CountsOverride).FirstOrDefault(c => c is not null);
+                if (choice != keep.CountsOverride)
+                {
+                    UpdateAdapter(keep with { CountsOverride = choice });
+                }
+            }
+        });
+        return merged;
+    }
+
+    private void MoveUsage(string table, string timeColumn, string idColumn, long fromId, long toId)
+    {
+        using (SqliteCommand move = Command(
+                   $"INSERT INTO {table}({timeColumn}, {idColumn}, rx, tx) SELECT {timeColumn}, $to, rx, tx FROM {table} WHERE {idColumn} = $from " +
+                   $"ON CONFLICT({timeColumn}, {idColumn}) DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx",
+                   ("$to", toId), ("$from", fromId)))
+        {
+            move.ExecuteNonQuery();
+        }
+
+        using SqliteCommand delete = Command($"DELETE FROM {table} WHERE {idColumn} = $from", ("$from", fromId));
+        delete.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Brings every app's key up to <see cref="AppKeys.Current"/> and folds together apps that end up with the same
+    /// key, adding their usage. Earlier versions keyed programs by full path, so every update installed into a new
+    /// version folder became a new app, and kept the sign-in-specific suffix of per-user services. The newest record
+    /// (and its path, for the icon) survives. Returns how many records were folded away.
+    /// </summary>
+    public int MergeDuplicateApps()
+    {
+        var apps = new List<(long Id, string Key, string Name, string? Path)>();
+        using (SqliteCommand cmd = Command("SELECT id, app_key, name, path FROM apps"))
+        using (SqliteDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                apps.Add((reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3)));
+            }
+        }
+
+        var groups = apps
+            .GroupBy(a => AppKeys.Current(a.Key, a.Name, a.Path))
+            .Where(g => g.Count() > 1 || g.First().Key != g.Key)
+            .ToList();
+        if (groups.Count == 0)
+        {
+            return 0;
+        }
+
+        int merged = 0;
+        InTransaction(_ =>
+        {
+            foreach (var group in groups)
+            {
+                var keep = group.MaxBy(a => a.Id);
+                foreach (var duplicate in group.Where(a => a.Id != keep.Id))
+                {
+                    MoveUsage("app_usage_hour", "hour", "app_id", duplicate.Id, keep.Id);
+                    using SqliteCommand delete = Command("DELETE FROM apps WHERE id = $id", ("$id", duplicate.Id));
+                    delete.ExecuteNonQuery();
+                    merged++;
+                }
+
+                if (keep.Key != group.Key)
+                {
+                    using SqliteCommand rekey = Command("UPDATE apps SET app_key = $k WHERE id = $id", ("$k", group.Key), ("$id", keep.Id));
+                    rekey.ExecuteNonQuery();
+                }
+            }
+        });
+        return merged;
     }
 
     public Dictionary<string, long> LoadAppIds()
@@ -190,6 +304,39 @@ internal sealed class Database : IDisposable
         return result;
     }
 
+    /// <summary>Gives stored Windows-service apps their English names where known. Returns how many were renamed.</summary>
+    public int RenameServiceApps()
+    {
+        var renames = new List<(long Id, string Name)>();
+        using (SqliteCommand cmd = Command("SELECT id, app_key, name FROM apps WHERE app_key LIKE 'svc:%'"))
+        using (SqliteDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                if (ServiceNames.EnglishNameForKey(reader.GetString(1)) is { } english && english != reader.GetString(2))
+                {
+                    renames.Add((reader.GetInt64(0), english));
+                }
+            }
+        }
+
+        foreach ((long id, string name) in renames)
+        {
+            using SqliteCommand update = Command("UPDATE apps SET name = $n WHERE id = $id", ("$id", id), ("$n", name));
+            update.ExecuteNonQuery();
+        }
+
+        return renames.Count;
+    }
+
+    public void UpdateApp(long id, string name, string? path)
+    {
+        using SqliteCommand cmd = Command(
+            "UPDATE apps SET name = $n, path = $p WHERE id = $id",
+            ("$id", id), ("$n", name), ("$p", (object?)path ?? DBNull.Value));
+        cmd.ExecuteNonQuery();
+    }
+
     public long AddApp(string key, string name, string? path)
     {
         using SqliteCommand cmd = Command(
@@ -202,23 +349,18 @@ internal sealed class Database : IDisposable
 
     public void Flush(PendingUsage pending, IEnumerable<AdapterRecord> touchedAdapters, long nowUtc)
     {
-        using SqliteTransaction tx = Begin();
-        Upsert(tx, "usage_minute", "minute", "adapter_id", pending.Minutes);
-        Upsert(tx, "usage_hour", "hour", "adapter_id", pending.Hours);
-        Upsert(tx, "app_usage_hour", "hour", "app_id", pending.AppHours);
-        foreach (AdapterRecord adapter in touchedAdapters)
+        InTransaction(tx =>
         {
-            UpdateAdapter(adapter);
-        }
+            Upsert(tx, "usage_minute", "minute", "adapter_id", pending.Minutes);
+            Upsert(tx, "usage_hour", "hour", "adapter_id", pending.Hours);
+            Upsert(tx, "app_usage_hour", "hour", "app_id", pending.AppHours);
+            foreach (AdapterRecord adapter in touchedAdapters)
+            {
+                UpdateAdapter(adapter);
+            }
 
-        using (SqliteCommand alive = Command(
-                   "INSERT INTO meta(name, value) VALUES('lastAlive', $v) ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-                   ("$v", nowUtc.ToString(System.Globalization.CultureInfo.InvariantCulture))))
-        {
-            alive.ExecuteNonQuery();
-        }
-
-        Commit();
+            SetMeta("lastAlive", nowUtc.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        });
     }
 
     private void Upsert(SqliteTransaction tx, string table, string timeColumn, string idColumn, Dictionary<(long Time, long Id), ByteCounts> rows)
@@ -448,8 +590,12 @@ internal sealed class Database : IDisposable
     {
         Validate(data);
         var result = new ImportResult();
-        using SqliteTransaction tx = Begin();
+        InTransaction(tx => ImportCore(tx, data, result));
+        return result;
+    }
 
+    private void ImportCore(SqliteTransaction tx, BackupData data, ImportResult result)
+    {
         var adapterMap = new Dictionary<long, long>();
         Dictionary<Guid, AdapterRecord> existingAdapters = LoadAdapters().ToDictionary(a => a.Guid);
         foreach (BackupAdapter a in data.Adapters)
@@ -481,9 +627,6 @@ internal sealed class Database : IDisposable
                 cmd.ExecuteNonQuery();
             }
         }
-
-        Commit();
-        return result;
     }
 
     private int Replace(
@@ -522,13 +665,8 @@ internal sealed class Database : IDisposable
             insert.Prepare();
             foreach (UsageRecord row in rows)
             {
-                if (!idMap.TryGetValue(row.Id, out long id))
-                {
-                    continue;
-                }
-
                 t.Value = row.Time;
-                i.Value = id;
+                i.Value = idMap[row.Id];
                 r.Value = row.Received;
                 s.Value = row.Sent;
                 insert.ExecuteNonQuery();
@@ -564,6 +702,15 @@ internal sealed class Database : IDisposable
         {
             throw new InvalidDataException("The backup contains an app without a key.");
         }
+
+        // Every row must belong to an adapter or app in the backup, or importing it would wipe an hour for nothing.
+        var adapterIds = data.Adapters.Select(a => a.Id).ToHashSet();
+        var appIds = data.Apps.Select(a => a.Id).ToHashSet();
+        if (data.Hours.Any(r => !adapterIds.Contains(r.Id)) || data.Minutes.Any(r => !adapterIds.Contains(r.Id))
+            || data.AppHours.Any(r => !appIds.Contains(r.Id)))
+        {
+            throw new InvalidDataException("The backup refers to adapters or apps it doesn't contain.");
+        }
     }
 
     // ---- snapshots ----
@@ -578,30 +725,43 @@ internal sealed class Database : IDisposable
     public void RestoreFrom(string snapshotPath)
     {
         _connection.Dispose();
-        foreach (string suffix in new[] { "-wal", "-shm" })
+        try
         {
-            File.Delete(_path + suffix);
-        }
+            foreach (string suffix in new[] { "-wal", "-shm" })
+            {
+                File.Delete(_path + suffix);
+            }
 
-        File.Copy(snapshotPath, _path, overwrite: true);
-        _connection = Open(_path);
+            File.Copy(snapshotPath, _path, overwrite: true);
+        }
+        finally
+        {
+            // Whether or not the copy worked, the service needs a working connection afterwards.
+            _connection = Open(_path);
+        }
     }
 
     public void Optimize() => Execute(_connection, "PRAGMA optimize;");
 
     // ---- helpers ----
 
-    private SqliteTransaction Begin()
+    /// <summary>
+    /// Runs <paramref name="work"/> in a transaction that every <see cref="Command"/> joins. On failure it rolls back,
+    /// and the field is always cleared so later commands don't try to join a dead transaction.
+    /// </summary>
+    private void InTransaction(Action<SqliteTransaction> work)
     {
-        _transaction = _connection.BeginTransaction();
-        return _transaction;
-    }
-
-    // Disposing the transaction without committing rolls it back; either way the field must be cleared.
-    private void Commit()
-    {
-        _transaction!.Commit();
-        _transaction = null;
+        using SqliteTransaction tx = _connection.BeginTransaction();
+        _transaction = tx;
+        try
+        {
+            work(tx);
+            tx.Commit();
+        }
+        finally
+        {
+            _transaction = null;
+        }
     }
 
     private SqliteCommand Command(string sql, params (string Name, object Value)[] parameters)

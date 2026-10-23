@@ -21,7 +21,16 @@ internal sealed class LedgerService : ServiceBase
     protected override void OnStart(string[] args)
     {
         _engine = new Engine(_dataDirectory, secureDataDirectory: true);
-        _engine.Start();
+        try
+        {
+            _engine.Start();
+        }
+        catch (Exception ex)
+        {
+            // Without this the Service Control Manager only reports "failed to start".
+            Log.Error("Startup failed", ex);
+            throw;
+        }
     }
 
     protected override void OnStop() => StopEngine();

@@ -5,7 +5,7 @@ using NetLedger.Core.Ipc;
 namespace NetLedger.Tray;
 
 /// <summary>Usage history by minute, hour, day, week, month and year, plus per-app usage and the outage log.</summary>
-internal sealed class StatsForm : Form
+internal sealed class StatsForm : ScaledForm
 {
     private enum View
     {
@@ -28,14 +28,23 @@ internal sealed class StatsForm : Form
         AllTime,
     }
 
+    /// <summary>Which kind of rows the list shows; each remembers its own sort order.</summary>
+    private enum ListKind
+    {
+        Usage,
+        Apps,
+        Outages,
+    }
+
     private static readonly CultureInfo Culture = CultureInfo.CurrentCulture;
 
     private readonly LedgerClient _client;
-    private readonly UiSettings _settings;
+    private UiSettings _settings;
     private readonly FlowLayoutPanel _tabs = new();
     private readonly Button _previous = new();
     private readonly Button _next = new();
     private readonly Button _today = new();
+    private readonly Button _settingsButton = new();
     private readonly Label _period = new();
     private readonly ComboBox _adapterBox = new();
     private readonly ComboBox _rangeBox = new();
@@ -46,7 +55,15 @@ internal sealed class StatsForm : Form
     private readonly Label _footer = new();
     private readonly ImageList _icons = new();
     private readonly Dictionary<string, int> _iconIndex = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<(View View, RadioButton Button)> _tabButtons = new();
+    private readonly List<(View View, NavButton Button)> _tabButtons = new();
+
+    // Default orders: periods oldest first, apps by total, outages newest first.
+    private readonly Dictionary<ListKind, (int Column, bool Descending)> _sort = new()
+    {
+        [ListKind.Usage] = (0, false),
+        [ListKind.Apps] = (3, true),
+        [ListKind.Outages] = (0, true),
+    };
 
     private View _view = View.Days;
     private AppRange _appRange = AppRange.Month;
@@ -56,6 +73,7 @@ internal sealed class StatsForm : Form
     private ServiceStatus? _status;
     private Font? _boldFont;
     private bool _populating;
+    private ListKind _listKind;
     private int _requestId;
 
     public StatsForm(LedgerClient client, UiSettings settings)
@@ -64,20 +82,19 @@ internal sealed class StatsForm : Form
         _settings = settings;
         Text = "NetLedger";
         Icon = TrayApp.AppIcon;
-        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(Px(560), Px(420));
         Size = new Size(
             settings.StatsWidth > 0 ? settings.StatsWidth : Px(820),
             settings.StatsHeight > 0 ? settings.StatsHeight : Px(640));
-        KeyPreview = true;
         Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 9f);
         BuildLayout();
         Theme.Apply(this);
         ApplyPalette();
     }
 
-    private int Px(int logical) => (int)Math.Round(logical * DeviceDpi / 96.0);
+    /// <summary>Raised when the Settings button is clicked.</summary>
+    public event Action? SettingsRequested;
 
     // ---- layout ----
 
@@ -88,16 +105,11 @@ internal sealed class StatsForm : Form
         _tabs.Padding = new Padding(Px(10), Px(10), Px(10), 0);
         foreach (View view in Enum.GetValues<View>())
         {
-            var button = new RadioButton
+            var button = new NavButton(view.ToString())
             {
-                Text = view.ToString(),
-                Appearance = Appearance.Button,
-                AutoSize = true,
-                FlatStyle = FlatStyle.Flat,
                 Margin = new Padding(0, 0, Px(4), 0),
                 Padding = new Padding(Px(6), Px(2), Px(6), Px(2)),
                 Checked = view == _view,
-                TextAlign = ContentAlignment.MiddleCenter,
             };
             View captured = view;
             button.CheckedChanged += (_, _) =>
@@ -117,6 +129,7 @@ internal sealed class StatsForm : Form
         ConfigureNavButton(_next, "▶", "Next period (Right arrow)");
         ConfigureNavButton(_today, "Now", "Jump to the current period");
         _today.Width = Px(52);
+        _today.AutoSize = true; // grows if the text needs more room at this DPI
         _previous.Click += (_, _) => Step(-1);
         _next.Click += (_, _) => Step(1);
         _today.Click += (_, _) =>
@@ -148,7 +161,11 @@ internal sealed class StatsForm : Form
             _appRange = (AppRange)_rangeBox.SelectedIndex;
             Reload();
         };
-        right.Controls.AddRange([_adapterBox, _rangeBox]);
+        ConfigureNavButton(_settingsButton, "Settings…", "Open NetLedger settings");
+        _settingsButton.AutoSize = true;
+        _settingsButton.Margin = new Padding(Px(8), 0, 0, 0);
+        _settingsButton.Click += (_, _) => SettingsRequested?.Invoke();
+        right.Controls.AddRange([_settingsButton, _adapterBox, _rangeBox]);
         nav.Controls.Add(left);
         nav.Controls.Add(right);
 
@@ -171,14 +188,16 @@ internal sealed class StatsForm : Form
         _list.Dock = DockStyle.Fill;
         _list.View = System.Windows.Forms.View.Details;
         _list.FullRowSelect = true;
-        _list.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+        _list.HeaderStyle = ColumnHeaderStyle.Clickable;
         _list.BorderStyle = BorderStyle.None;
         _list.SmallImageList = _icons;
+        _list.ColumnClick += (_, e) => SortBy(e.Column);
         _list.DoubleClick += (_, _) =>
         {
-            if (_list.SelectedIndices.Count == 1 && _view <= View.Years)
+            // Rows may be sorted, so the bucket comes from the row, not its position.
+            if (_list.SelectedItems.Count == 1 && _view <= View.Years && _list.SelectedItems[0].Tag is RowKeys row)
             {
-                DrillDown(_list.SelectedIndices[0]);
+                DrillDown(row.Index);
             }
         };
         _icons.ColorDepth = ColorDepth.Depth32Bit;
@@ -212,15 +231,12 @@ internal sealed class StatsForm : Form
     private void ApplyPalette()
     {
         Palette palette = Theme.Current;
-        foreach ((_, RadioButton button) in _tabButtons)
+        foreach ((_, NavButton button) in _tabButtons)
         {
-            button.FlatAppearance.BorderColor = palette.Border;
-            button.FlatAppearance.CheckedBackColor = palette.Dark ? Color.FromArgb(60, 60, 60) : Color.FromArgb(220, 230, 245);
-            button.BackColor = palette.Window;
-            button.ForeColor = palette.Text;
+            button.ApplyPalette();
         }
 
-        foreach (Button button in new[] { _previous, _next, _today })
+        foreach (Button button in new[] { _previous, _next, _today, _settingsButton })
         {
             button.FlatAppearance.BorderColor = palette.Border;
             button.BackColor = palette.Surface;
@@ -247,26 +263,47 @@ internal sealed class StatsForm : Form
         Reload();
     }
 
+    /// <summary>Switches to changed display settings (colours, units, week start) and redraws the current view.</summary>
+    public void UseSettings(UiSettings settings)
+    {
+        _settings = settings;
+        ApplyPalette();
+        Reload();
+    }
+
     /// <summary>Re-reads adapters, status and quota, then the current view.</summary>
     public async void RefreshAll()
     {
+        Theme.Apply(this);
         ApplyPalette();
         await RefreshMetaAsync();
         Reload();
     }
 
-    protected override void OnKeyDown(KeyEventArgs e)
+    // Handled here rather than in KeyDown: a focused tab button would otherwise use the arrows to switch tabs.
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        base.OnKeyDown(e);
-        if (e.KeyCode is Keys.Left or Keys.Right && !_adapterBox.Focused && !_rangeBox.Focused)
+        if (keyData is Keys.Left or Keys.Right && !_adapterBox.Focused && !_rangeBox.Focused)
         {
-            Step(e.KeyCode == Keys.Left ? -1 : 1);
-            e.Handled = true;
+            Step(keyData == Keys.Left ? -1 : 1);
+            return true;
         }
-        else if (e.KeyCode == Keys.F5)
+
+        if (keyData == Keys.F5)
         {
             RefreshAll();
+            return true;
         }
+
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+
+        // Column widths and the bold row font were made for the old DPI; WinForms doesn't rescale those.
+        Reload();
     }
 
     protected override void OnResizeEnd(EventArgs e)
@@ -527,16 +564,19 @@ internal sealed class StatsForm : Form
         _buckets = response.Buckets ?? [];
         DateTime now = DateTime.Now;
         var bars = new List<ChartBar>(_buckets.Count);
+        var items = new List<ListViewItem>(_buckets.Count);
         _list.BeginUpdate();
-        _list.Items.Clear();
-        _list.Columns.Clear();
-        _list.Columns.Add(kind switch { BucketKind.Minute => "Minute", BucketKind.Hour => "Hour", BucketKind.Day => "Day", BucketKind.Week => "Week", BucketKind.Month => "Month", _ => "Year" }, Px(260));
-        _list.Columns.Add("Download", Px(120), HorizontalAlignment.Right);
-        _list.Columns.Add("Upload", Px(120), HorizontalAlignment.Right);
-        _list.Columns.Add("Total", Px(120), HorizontalAlignment.Right);
+        SetColumns(ListKind.Usage,
+            (kind switch { BucketKind.Minute => "Minute", BucketKind.Hour => "Hour", BucketKind.Day => "Day", BucketKind.Week => "Week", BucketKind.Month => "Month", _ => "Year" }, 260, false),
+            ("Download", 120, true),
+            ("Upload", 120, true),
+            ("Total", 120, true));
         long totalRx = 0, totalTx = 0;
         int elapsedBuckets = 0;
-        foreach (UsageBucket bucket in _buckets)
+
+        // Periods before the first recorded traffic (e.g. before NetLedger was installed) would drag the average down.
+        int firstWithData = _buckets.FindIndex(b => b.Total > 0);
+        foreach ((UsageBucket bucket, int index) in _buckets.Select((b, i) => (b, i)))
         {
             DateTime next = kind is BucketKind.Minute or BucketKind.Hour
                 ? bucket.LocalStart.AddSeconds(kind == BucketKind.Minute ? 60 : 3600)
@@ -546,12 +586,15 @@ internal sealed class StatsForm : Form
             bars.Add(new ChartBar(ShortLabel(bucket.LocalStart, kind), LongLabel(bucket.LocalStart, kind), bucket.Received, bucket.Sent, future, current));
             totalRx += bucket.Received;
             totalTx += bucket.Sent;
-            if (!future)
+            if (!future && firstWithData >= 0 && index >= firstWithData)
             {
                 elapsedBuckets++;
             }
 
-            var item = new ListViewItem(LongLabel(bucket.LocalStart, kind));
+            var item = new ListViewItem(LongLabel(bucket.LocalStart, kind))
+            {
+                Tag = new RowKeys([index, bucket.Received, bucket.Sent, bucket.Total], index),
+            };
             item.SubItems.Add(ByteFormat.Size(bucket.Received));
             item.SubItems.Add(ByteFormat.Size(bucket.Sent));
             item.SubItems.Add(ByteFormat.Size(bucket.Total));
@@ -561,18 +604,31 @@ internal sealed class StatsForm : Form
             }
             else if (current)
             {
-                item.Font = _boldFont ??= new Font(_list.Font, FontStyle.Bold);
+                item.Font = BoldListFont();
             }
 
-            _list.Items.Add(item);
+            items.Add(item);
         }
 
+        FillList(items);
         _list.EndUpdate();
         _chart.EmptyText = "No traffic recorded in this period";
         _chart.SetBars(bars);
         string unit = kind switch { BucketKind.Minute => "minute", BucketKind.Hour => "hour", BucketKind.Day => "day", BucketKind.Week => "week", BucketKind.Month => "month", _ => "year" };
         string average = elapsedBuckets > 0 ? $"   ·   Average per {unit}: {ByteFormat.Size((totalRx + totalTx) / elapsedBuckets)}" : "";
         _footer.Text = $"Total  ↓ {ByteFormat.Size(totalRx)}   ↑ {ByteFormat.Size(totalTx)}   Σ {ByteFormat.Size(totalRx + totalTx)}{average}";
+    }
+
+    // WinForms swaps the list's font when the window changes DPI, so the bold copy has to follow it.
+    private Font BoldListFont()
+    {
+        if (_boldFont is null || _boldFont.Size != _list.Font.Size || _boldFont.Unit != _list.Font.Unit)
+        {
+            _boldFont?.Dispose();
+            _boldFont = new Font(_list.Font, FontStyle.Bold);
+        }
+
+        return _boldFont;
     }
 
     private static string ShortLabel(DateTime start, BucketKind kind) => kind switch
@@ -608,16 +664,11 @@ internal sealed class StatsForm : Form
         _next.Enabled = _appRange != AppRange.AllTime && to <= DateTime.Now;
         var range = new RangeQuery { FromLocal = from, ToLocal = to };
         IpcResponse apps = await _client.CallAsync(new IpcRequest { Op = Ops.Apps, Range = range });
-        long adapterTotal = 0;
-        if (from != default)
-        {
-            IpcResponse usage = await _client.CallAsync(new IpcRequest
-            {
-                Op = Ops.Usage,
-                Usage = new UsageQuery { Kind = BucketKind.Day, FromLocal = from, ToLocal = to, WeekStart = _settings.WeekStart },
-            });
-            adapterTotal = usage.Buckets?.Sum(b => b.Total) ?? 0;
-        }
+        UsageQuery totalQuery = from == default
+            ? new UsageQuery { Kind = BucketKind.Year, ToLocal = new DateTime(DateTime.Now.Year + 1, 1, 1) }
+            : new UsageQuery { Kind = BucketKind.Day, FromLocal = from, ToLocal = to, WeekStart = _settings.WeekStart };
+        IpcResponse usage = await _client.CallAsync(new IpcRequest { Op = Ops.Usage, Usage = totalQuery });
+        long adapterTotal = usage.Buckets?.Sum(b => b.Total) ?? 0;
 
         if (id != _requestId)
         {
@@ -638,37 +689,47 @@ internal sealed class StatsForm : Form
         List<AppUsageRow> rows = apps.Apps ?? [];
         long appTotal = rows.Sum(r => r.Received + r.Sent);
         long grand = Math.Max(appTotal, adapterTotal);
+        var items = new List<ListViewItem>(rows.Count + 1);
         _list.BeginUpdate();
-        _list.Items.Clear();
-        _list.Columns.Clear();
-        _list.Columns.Add("App", Px(300));
-        _list.Columns.Add("Download", Px(110), HorizontalAlignment.Right);
-        _list.Columns.Add("Upload", Px(110), HorizontalAlignment.Right);
-        _list.Columns.Add("Total", Px(110), HorizontalAlignment.Right);
-        _list.Columns.Add("Share", Px(70), HorizontalAlignment.Right);
-        foreach (AppUsageRow row in rows)
+        SetColumns(ListKind.Apps, ("App", 300, false), ("Download", 110, true), ("Upload", 110, true), ("Total", 110, true), ("Share", 70, true));
+        // Different programs can share a description (java.exe and javaw.exe are both "OpenJDK Platform binary"),
+        // so repeated names get the program file added.
+        HashSet<string> repeated = rows.GroupBy(r => r.Name).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
+        foreach ((AppUsageRow row, int index) in rows.Select((r, i) => (r, i)))
         {
             long total = row.Received + row.Sent;
-            var item = new ListViewItem(row.Name) { ImageIndex = IconFor(row.Path), ToolTipText = row.Path ?? row.Key };
+            string name = repeated.Contains(row.Name) && row.Path is not null ? $"{row.Name} ({Path.GetFileName(row.Path)})" : row.Name;
+            var item = new ListViewItem(name)
+            {
+                ImageIndex = IconFor(row.Path),
+                ToolTipText = row.Path ?? row.Key,
+                Tag = new RowKeys([name, row.Received, row.Sent, total, total], index),
+            };
             item.SubItems.Add(ByteFormat.Size(row.Received));
             item.SubItems.Add(ByteFormat.Size(row.Sent));
             item.SubItems.Add(ByteFormat.Size(total));
             item.SubItems.Add(grand > 0 ? (total * 100.0 / grand).ToString("0.0", Culture) + " %" : "");
-            _list.Items.Add(item);
+            items.Add(item);
         }
 
         if (adapterTotal > appTotal && rows.Count > 0)
         {
             long other = adapterTotal - appTotal;
-            var item = new ListViewItem("Other (protocol overhead, untracked traffic)") { ForeColor = Theme.Current.SubtleText, ImageIndex = -1 };
+            var item = new ListViewItem("Other (protocol overhead, untracked traffic)")
+            {
+                ForeColor = Theme.Current.SubtleText,
+                ImageIndex = -1,
+                Tag = new RowKeys(["", 0L, 0L, other, other], rows.Count, PinnedLast: true),
+            };
             item.SubItems.Add("");
             item.SubItems.Add("");
             item.SubItems.Add(ByteFormat.Size(other));
             item.SubItems.Add((other * 100.0 / grand).ToString("0.0", Culture) + " %");
-            _list.Items.Add(item);
+            items.Add(item);
         }
 
         _list.ShowItemToolTips = true;
+        FillList(items);
         _list.EndUpdate();
         _footer.Text = rows.Count == 0
             ? "No per-app data for this period."
@@ -718,30 +779,32 @@ internal sealed class StatsForm : Form
         {
             null => null,
             { Online: false, OfflineSinceUtc: long since } => $"Offline since {Local(since):HH:mm:ss}.",
-            { Online: true } => "Online now. Outages are detected by a small web request every minute (see Settings).",
+            { Online: true } => "Online now. Outages are detected with a small web request; see Settings → Connectivity.",
             _ => "The outage log is off, or no check has finished yet.",
         };
         SetBanner(note, warning: _status?.Online == false);
 
         List<OutageRow> rows = response.Outages ?? [];
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var items = new List<ListViewItem>(rows.Count);
         _list.BeginUpdate();
-        _list.Items.Clear();
-        _list.Columns.Clear();
-        _list.Columns.Add("Lost connection", Px(240));
-        _list.Columns.Add("Back online", Px(200));
-        _list.Columns.Add("Duration", Px(140), HorizontalAlignment.Right);
+        SetColumns(ListKind.Outages, ("Lost connection", 240, false), ("Back online", 200, false), ("Duration", 140, true));
         long downtime = 0;
-        foreach (OutageRow row in rows)
+        foreach ((OutageRow row, int index) in rows.Select((r, i) => (r, i)))
         {
             long end = row.EndUtc ?? now;
             downtime += end - row.StartUtc;
-            var item = new ListViewItem(Local(row.StartUtc).ToString("ddd d MMM yyyy  HH:mm:ss", Culture));
+            var item = new ListViewItem(Local(row.StartUtc).ToString("ddd d MMM yyyy  HH:mm:ss", Culture))
+            {
+                // Still-offline rows sort as ending last.
+                Tag = new RowKeys([row.StartUtc, row.EndUtc ?? long.MaxValue, end - row.StartUtc], index),
+            };
             item.SubItems.Add(row.EndUtc is long e ? Local(e).ToString("HH:mm:ss", Culture) : "still offline");
             item.SubItems.Add(Duration(end - row.StartUtc));
-            _list.Items.Add(item);
+            items.Add(item);
         }
 
+        FillList(items);
         _list.EndUpdate();
         _footer.Text = rows.Count == 0
             ? "No outages recorded."
@@ -750,7 +813,85 @@ internal sealed class StatsForm : Form
 
     private static DateTime Local(long utcSeconds) => DateTimeOffset.FromUnixTimeSeconds(utcSeconds).LocalDateTime;
 
-    internal static string Duration(long seconds)
+    // ---- sorting ----
+
+    /// <summary>Replaces the columns and rows. Each column's plain title is kept in its Tag for the sort arrow.</summary>
+    private void SetColumns(ListKind kind, params (string Title, int Width, bool Right)[] columns)
+    {
+        _listKind = kind;
+        _list.ListViewItemSorter = null;
+        _list.Items.Clear();
+        _list.Columns.Clear();
+        foreach ((string title, int width, bool right) in columns)
+        {
+            _list.Columns.Add(new ColumnHeader
+            {
+                Text = title,
+                Tag = title,
+                Width = Px(width),
+                TextAlign = right ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+            });
+        }
+    }
+
+    private void FillList(List<ListViewItem> items)
+    {
+        _list.Items.AddRange(items.ToArray());
+        ApplySort();
+    }
+
+    private void SortBy(int column)
+    {
+        (int current, bool descending) = _sort[_listKind];
+        // Clicking the sorted column reverses it; another column starts with names A–Z and amounts largest first.
+        _sort[_listKind] = column == current
+            ? (column, !descending)
+            : (column, _listKind == ListKind.Outages || column > 0);
+        _list.BeginUpdate();
+        ApplySort();
+        _list.EndUpdate();
+    }
+
+    private void ApplySort()
+    {
+        (int column, bool descending) = _sort[_listKind];
+        column = Math.Min(column, _list.Columns.Count - 1);
+        foreach (ColumnHeader header in _list.Columns)
+        {
+            header.Text = header.Index == column ? $"{header.Tag}  {(descending ? "▼" : "▲")}" : (string)header.Tag!;
+        }
+
+        _list.ListViewItemSorter = new RowComparer(column, descending); // assigning it sorts the list
+    }
+
+    /// <summary>What a row sorts by in each column. <paramref name="Index"/> is its place in the loaded data.</summary>
+    private sealed record RowKeys(object[] Keys, int Index, bool PinnedLast = false);
+
+    private sealed class RowComparer(int column, bool descending) : System.Collections.IComparer
+    {
+        public int Compare(object? x, object? y)
+        {
+            var a = (RowKeys)((ListViewItem)x!).Tag!;
+            var b = (RowKeys)((ListViewItem)y!).Tag!;
+            if (a.PinnedLast != b.PinnedLast)
+            {
+                return a.PinnedLast ? 1 : -1; // "Other" stays at the bottom whichever way the list is sorted
+            }
+
+            int result = a.Keys[column] is string textA && b.Keys[column] is string textB
+                ? string.Compare(textA, textB, StringComparison.CurrentCultureIgnoreCase)
+                : Comparer<object>.Default.Compare(a.Keys[column], b.Keys[column]);
+            if (descending)
+            {
+                result = -result;
+            }
+
+            // Equal values keep their original order.
+            return result != 0 ? result : a.Index.CompareTo(b.Index);
+        }
+    }
+
+    private static string Duration(long seconds)
     {
         var span = TimeSpan.FromSeconds(Math.Max(0, seconds));
         if (span.TotalMinutes < 1)

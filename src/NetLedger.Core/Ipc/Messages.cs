@@ -185,7 +185,6 @@ public sealed class OutageRow
 public sealed class ServiceStatus
 {
     public string Version { get; set; } = "";
-    public long StartedUtc { get; set; }
     public bool AppTracking { get; set; }
     public string? AppTrackingError { get; set; }
     public long EventsLost { get; set; }

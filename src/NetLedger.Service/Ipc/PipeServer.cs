@@ -84,7 +84,7 @@ internal sealed class PipeServer : IDisposable
             catch (Exception ex)
             {
                 Log.Warn($"Pipe connection failed: {ex.Message}");
-                await Task.Delay(250, CancellationToken.None).ConfigureAwait(false);
+                await Task.Delay(1000, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {

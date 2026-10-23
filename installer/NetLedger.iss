@@ -67,16 +67,32 @@ const
   DesktopRuntimeKey = 'SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App';
   RuntimeDownload = 'https://dotnet.microsoft.com/download/dotnet/10.0';
 
-function HasDesktopRuntime10: Boolean;
+function ListsVersion10(RootKey: Integer): Boolean;
 var
   Names: TArrayOfString;
   I: Integer;
 begin
   Result := False;
-  if RegGetValueNames(HKLM64, DesktopRuntimeKey, Names) then
+  if RegGetValueNames(RootKey, DesktopRuntimeKey, Names) then
     for I := 0 to GetArrayLength(Names) - 1 do
       if Copy(Names[I], 1, 3) = '10.' then
         Result := True;
+end;
+
+function HasDesktopRuntime10: Boolean;
+var
+  FindRec: TFindRec;
+begin
+  // The runtime folder is what the app actually loads from, so it is the most reliable sign.
+  Result := FindFirst(ExpandConstant('{commonpf64}\dotnet\shared\Microsoft.WindowsDesktop.App\10.*'), FindRec);
+  if Result then
+  begin
+    FindClose(FindRec);
+    Exit;
+  end;
+
+  // Otherwise ask the registry. .NET's own setup records versions in the 32-bit view, even for x64 runtimes.
+  Result := ListsVersion10(HKLM32) or ListsVersion10(HKLM64);
 end;
 
 function InitializeSetup: Boolean;

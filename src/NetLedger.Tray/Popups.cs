@@ -62,6 +62,8 @@ internal class PopupForm : Form
 /// <summary>The summary that appears when hovering over the taskbar widget.</summary>
 internal sealed class HoverCard : PopupForm
 {
+    // Shown and repainted every second while hovered, so the font is made once.
+    private readonly Font _font = new(SystemFonts.MessageBoxFont!.FontFamily, 9f);
     private readonly List<(string Label, string Value)> _rows = new();
     private string? _note;
     private Color _noteColor;
@@ -74,7 +76,7 @@ internal sealed class HoverCard : PopupForm
         _note = note;
         _noteColor = noteIsWarning ? Palette.Warning : Palette.SubtleText;
 
-        using Font font = new(SystemFonts.MessageBoxFont!.FontFamily, 9f);
+        Font font = _font;
         int labelWidth = 0, valueWidth = 0, lineHeight = 0;
         foreach ((string label, string value) in _rows)
         {
@@ -105,7 +107,7 @@ internal sealed class HoverCard : PopupForm
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        using Font font = new(SystemFonts.MessageBoxFont!.FontFamily, 9f);
+        Font font = _font;
         int y = Px(10);
         int lineHeight = TextRenderer.MeasureText("Ag", font).Height;
         int valueRight = Width - Px(12);
@@ -122,6 +124,16 @@ internal sealed class HoverCard : PopupForm
             var bounds = new Rectangle(Px(12), y + Px(4), Width - Px(24), Height - y);
             TextRenderer.DrawText(e.Graphics, _note, font, bounds, _noteColor, TextFormatFlags.WordBreak);
         }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _font.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }
 

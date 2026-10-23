@@ -58,13 +58,11 @@ internal sealed unsafe class TaskbarWidget : NativeWindow, IDisposable
 
     public event Action<Point>? MenuRequested;
 
-    public event Action<Rectangle>? HoverStarted;
+    public event Action? HoverStarted;
 
     public event Action? HoverEnded;
 
     public Rectangle ScreenBounds => new(_screenPosition, _size);
-
-    public bool IsEmbedded => _embedded && Handle != 0;
 
     public void ApplySettings(UiSettings settings)
     {
@@ -221,14 +219,20 @@ internal sealed unsafe class TaskbarWidget : NativeWindow, IDisposable
 
     private bool LayoutChanged()
     {
+        (Native.RECT tray, Native.RECT notify) = ReadTaskbarRects();
+        return !tray.Equals(_trayRect) || !notify.Equals(_notifyRect) || Native.GetDpiForWindow(_tray) != _dpi;
+    }
+
+    /// <summary>The taskbar and notification-area rectangles; without a notification area, its right edge.</summary>
+    private (Native.RECT Tray, Native.RECT Notify) ReadTaskbarRects()
+    {
         Native.GetWindowRect(_tray, out Native.RECT tray);
-        Native.RECT notify = default;
-        if (_notify != 0)
+        if (_notify == 0 || !Native.GetWindowRect(_notify, out Native.RECT notify))
         {
-            Native.GetWindowRect(_notify, out notify);
+            notify = new Native.RECT { Left = tray.Right, Right = tray.Right, Top = tray.Top, Bottom = tray.Bottom };
         }
 
-        return !tray.Equals(_trayRect) || !notify.Equals(_notifyRect) || Native.GetDpiForWindow(_tray) != _dpi;
+        return (tray, notify);
     }
 
     /// <summary>A floating window has to dodge full-screen apps and an auto-hidden taskbar by itself.</summary>
@@ -257,13 +261,7 @@ internal sealed unsafe class TaskbarWidget : NativeWindow, IDisposable
 
     private void Layout()
     {
-        Native.GetWindowRect(_tray, out _trayRect);
-        _notifyRect = default;
-        if (_notify == 0 || !Native.GetWindowRect(_notify, out _notifyRect))
-        {
-            _notifyRect = new Native.RECT { Left = _trayRect.Right, Right = _trayRect.Right, Top = _trayRect.Top, Bottom = _trayRect.Bottom };
-        }
-
+        (_trayRect, _notifyRect) = ReadTaskbarRects();
         _dpi = Native.GetDpiForWindow(_tray);
         _scale = (_dpi == 0 ? 96 : _dpi) / 96f;
 
@@ -509,7 +507,7 @@ internal sealed unsafe class TaskbarWidget : NativeWindow, IDisposable
                 _tracking = Native.TrackMouseEvent(ref tme);
                 break;
             case Native.WM_MOUSEHOVER:
-                HoverStarted?.Invoke(ScreenBounds);
+                HoverStarted?.Invoke();
                 break;
             case Native.WM_MOUSELEAVE:
                 _tracking = false;

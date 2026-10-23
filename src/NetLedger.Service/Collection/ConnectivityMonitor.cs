@@ -40,6 +40,7 @@ internal sealed class ConnectivityMonitor : IDisposable
         })
         {
             Timeout = ProbeTimeout,
+            MaxResponseContentBufferSize = 1024 * 1024,
         };
     }
 
@@ -237,8 +238,9 @@ internal sealed class ConnectivityMonitor : IDisposable
             string body = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
             return body.Contains(expect, StringComparison.Ordinal);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
+        catch (Exception) when (!token.IsCancellationRequested)
         {
+            // Any failure to fetch the page (DNS, TLS, timeout, oversized captive portal...) means offline.
             return false;
         }
     }

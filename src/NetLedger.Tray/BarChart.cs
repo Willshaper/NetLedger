@@ -52,7 +52,7 @@ internal sealed class BarChart : Control
             }
         }
 
-        long max = Math.Max(1, _bars.Max(b => b.Received + b.Sent));
+        long max = Math.Max(1024, _bars.Max(b => b.Received + b.Sent));
         long top = NiceCeiling(max);
         int labelWidth = Enumerable.Range(0, 5)
             .Max(i => TextRenderer.MeasureText(ByteFormat.Size(top * i / 4), Font).Width);
@@ -175,7 +175,7 @@ internal sealed class BarChart : Control
     }
 
     /// <summary>Rounds up to 1, 2, 2.5 or 5 × 10ⁿ of the most readable byte unit.</summary>
-    internal static long NiceCeiling(long value)
+    private static long NiceCeiling(long value)
     {
         double step = ByteFormat.SizeBase == SizeBase.Binary ? 1024 : 1000;
         double unit = 1;

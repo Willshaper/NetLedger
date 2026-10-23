@@ -109,6 +109,9 @@ internal sealed unsafe partial class EtwNetworkSession : IDisposable
         }
     }
 
+    /// <summary>False once the session has ended, for instance because another tool stopped it.</summary>
+    public bool IsRunning => _thread?.IsAlive == true;
+
     /// <summary>Takes the per-process byte counts gathered since the previous call.</summary>
     public Dictionary<uint, ByteCounts> Drain()
     {

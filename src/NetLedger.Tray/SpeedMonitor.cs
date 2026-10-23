@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using NetLedger.Core;
+using NetLedger.Core.Ipc;
 using NetLedger.Core.Native;
 
 namespace NetLedger.Tray;
@@ -24,6 +25,7 @@ internal sealed class SpeedMonitor : IDisposable
     private int _count;
     private long _last = Stopwatch.GetTimestamp();
     private Dictionary<Guid, bool> _countsByGuid = new();
+    private Dictionary<(string, string), bool> _countsByName = new();
     private bool _disposed;
     private int _sampling;
 
@@ -38,12 +40,23 @@ internal sealed class SpeedMonitor : IDisposable
 
     public int SmoothingSeconds { get; set; } = 2;
 
-    /// <summary>The service's per-adapter choice; adapters it doesn't know yet follow the automatic rule.</summary>
-    public void SetCountedAdapters(Dictionary<Guid, bool> countsByGuid)
+    /// <summary>
+    /// The service's per-adapter choice. An adapter is matched by GUID, then by name and description (VPN tunnels come
+    /// back with a new GUID on every connect); anything else follows the automatic rule.
+    /// </summary>
+    public void SetCountedAdapters(IReadOnlyList<AdapterInfo> adapters)
     {
+        var byGuid = adapters.ToDictionary(a => a.Guid, a => a.CountsInTotal);
+        var byName = new Dictionary<(string, string), bool>();
+        foreach (AdapterInfo adapter in adapters)
+        {
+            byName.TryAdd((adapter.Name, adapter.Description), adapter.CountsInTotal);
+        }
+
         lock (_gate)
         {
-            _countsByGuid = countsByGuid;
+            _countsByGuid = byGuid;
+            _countsByName = byName;
         }
     }
 
@@ -117,12 +130,8 @@ internal sealed class SpeedMonitor : IDisposable
             _last = now;
             IfTable.Read(_snapshots);
             _tracker.Update(_snapshots, elapsed, _deltas);
-            if (elapsed > 5)
-            {
-                // Woke from sleep or the process was stalled: don't spread a burst over a fake second.
-                elapsed = 1;
-            }
 
+            // After a stall the delta covers the whole gap, so dividing by the real time gives its average rate.
             double rx = 0, tx = 0;
             lock (_gate)
             {
@@ -135,6 +144,7 @@ internal sealed class SpeedMonitor : IDisposable
                 {
                     InterfaceSnapshot nic = delta.Interface;
                     bool counts = _countsByGuid.TryGetValue(nic.Guid, out bool chosen)
+                                  || _countsByName.TryGetValue((nic.Alias, nic.Description), out chosen)
                         ? chosen
                         : IfTable.CountsByDefault(nic.IsHardware, nic.IfType);
                     if (counts)

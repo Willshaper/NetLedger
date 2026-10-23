@@ -12,6 +12,11 @@ internal sealed class Palette
     public required Color SubtleText { get; init; }
     public required Color Border { get; init; }
     public required Color Grid { get; init; }
+
+    /// <summary>Background of the selected tab.</summary>
+    public required Color Selection { get; init; }
+
+    public required Color Hover { get; init; }
     public required Color Accent { get; init; }
     public required Color Warning { get; init; }
     public required Color Danger { get; init; }
@@ -30,6 +35,8 @@ internal static class Theme
         SubtleText = Color.FromArgb(170, 170, 170),
         Border = Color.FromArgb(64, 64, 64),
         Grid = Color.FromArgb(58, 58, 58),
+        Selection = Color.FromArgb(31, 68, 110),
+        Hover = Color.FromArgb(52, 52, 52),
         Accent = Color.FromArgb(96, 165, 250),
         Warning = Color.FromArgb(245, 180, 70),
         Danger = Color.FromArgb(240, 100, 90),
@@ -44,17 +51,30 @@ internal static class Theme
         SubtleText = Color.FromArgb(96, 96, 96),
         Border = Color.FromArgb(222, 222, 222),
         Grid = Color.FromArgb(232, 232, 232),
+        Selection = Color.FromArgb(204, 228, 247),
+        Hover = Color.FromArgb(235, 235, 235),
         Accent = Color.FromArgb(0, 103, 192),
         Warning = Color.FromArgb(196, 120, 0),
         Danger = Color.FromArgb(196, 43, 28),
     };
 
-    /// <summary>The taskbar has its own light/dark setting, separate from apps.</summary>
-    public static bool TaskbarIsLight => ReadFlag("SystemUsesLightTheme", fallback: false);
+    // Read once and cached: these are consulted on every paint, and the widget paints every second.
+    private static bool? s_taskbarIsLight;
+    private static bool? s_appsAreLight;
 
-    public static bool AppsAreLight => ReadFlag("AppsUseLightTheme", fallback: true);
+    /// <summary>The taskbar has its own light/dark setting, separate from apps.</summary>
+    public static bool TaskbarIsLight => s_taskbarIsLight ??= ReadFlag("SystemUsesLightTheme", fallback: false);
+
+    public static bool AppsAreLight => s_appsAreLight ??= ReadFlag("AppsUseLightTheme", fallback: true);
 
     public static Palette Current => AppsAreLight ? LightPalette : DarkPalette;
+
+    /// <summary>Forgets the cached light/dark flags; call when Windows reports a settings change.</summary>
+    public static void Refresh()
+    {
+        s_taskbarIsLight = null;
+        s_appsAreLight = null;
+    }
 
     private static bool ReadFlag(string name, bool fallback)
     {

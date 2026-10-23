@@ -8,6 +8,36 @@ namespace NetLedger.Service.Collection;
 internal sealed record AppIdentity(string Key, string Name, string? Path);
 
 /// <summary>
+/// How traffic is grouped into apps. Programs are keyed by file name and description, not full path, so an app
+/// that installs every update into a new version folder (Discord's app-1.0.x, Store apps, ...) stays one app.
+/// </summary>
+internal static class AppKeys
+{
+    public const string ServicePrefix = "svc:";
+
+    public static string ForExecutable(string path, string name) =>
+        $"exe:{Path.GetFileName(path).ToLowerInvariant()}|{name}";
+
+    /// <summary>Key for an svchost.exe instance. Per-user services lose their sign-in-specific suffix.</summary>
+    public static string ForServices(IEnumerable<string> serviceNames) =>
+        ServicePrefix + string.Join('+', serviceNames
+            .Select(n => ServiceNames.BaseName(n).ToLowerInvariant())
+            .Distinct()
+            .Order(StringComparer.Ordinal));
+
+    /// <summary>The key a stored app would get today (used to bring older records up to date).</summary>
+    public static string Current(string key, string name, string? path)
+    {
+        if (key.StartsWith(ServicePrefix, StringComparison.Ordinal))
+        {
+            return ForServices(key[ServicePrefix.Length..].Split('+'));
+        }
+
+        return path is null ? key : ForExecutable(path, name);
+    }
+}
+
+/// <summary>
 /// Maps process ids to apps. Ids are reused by Windows, so every lookup checks the process creation time.
 /// svchost.exe instances are split by the services they host.
 /// </summary>
@@ -87,12 +117,7 @@ internal sealed unsafe partial class ProcessResolver
             List<(string Name, string Display)>? services = ServicesFor(pid);
             if (services is { Count: > 0 })
             {
-                services.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
-                string key = "svc:" + string.Join('+', services.Select(s => s.Name.ToLowerInvariant()));
-                string name = services.Count == 1
-                    ? services[0].Display
-                    : "Service host: " + string.Join(", ", services.Select(s => s.Display));
-                return new AppIdentity(key, name, path);
+                return new AppIdentity(AppKeys.ForServices(services.Select(s => s.Name)), ServiceNames.Describe(services), path);
             }
         }
 
@@ -102,7 +127,7 @@ internal sealed unsafe partial class ProcessResolver
             _nameByPath[path] = display;
         }
 
-        return new AppIdentity(path.ToLowerInvariant(), display, path);
+        return new AppIdentity(AppKeys.ForExecutable(path, display), display, path);
     }
 
     private static string DescribeFile(string path)

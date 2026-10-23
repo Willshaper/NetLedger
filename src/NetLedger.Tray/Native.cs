@@ -12,9 +12,7 @@ internal static unsafe partial class Native
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int WS_EX_TOPMOST = 0x00000008;
     public const int WS_EX_NOACTIVATE = 0x08000000;
-    public const int WS_EX_TRANSPARENT = 0x00000020;
 
-    public const int WM_DESTROY = 0x0002;
     public const int WM_SETTINGCHANGE = 0x001A;
     public const int WM_DISPLAYCHANGE = 0x007E;
     public const int WM_MOUSEMOVE = 0x0200;
@@ -149,6 +147,12 @@ internal static unsafe partial class Native
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool SetForegroundWindow(nint hwnd);
 
+    public const int ASFW_ANY = -1;
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool AllowSetForegroundWindow(int processId);
+
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool UpdateLayeredWindow(
@@ -186,7 +190,6 @@ internal static unsafe partial class Native
     public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
     public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     public const int DWMWCP_ROUND = 2;
-    public const int DWMWCP_ROUNDSMALL = 3;
 
     /// <summary>A full-screen game, video or presentation is in front; floating overlays should hide.</summary>
     public static bool IsFullScreenAppActive()

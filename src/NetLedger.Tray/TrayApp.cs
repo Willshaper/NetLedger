@@ -59,6 +59,7 @@ internal sealed class TrayApp : ApplicationContext
         _environmentTimer.Tick += (_, _) =>
         {
             _environmentTimer.Stop();
+            Theme.Refresh();
             _widget.Attach();
             _stats?.RefreshAll();
         };
@@ -90,7 +91,7 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
-    private void OnHoverStarted(Rectangle bounds)
+    private void OnHoverStarted()
     {
         _hovering = true;
         ShowHoverCard();
@@ -168,6 +169,7 @@ internal sealed class TrayApp : ApplicationContext
         if (_stats is null || _stats.IsDisposed)
         {
             _stats = new StatsForm(_client, _settings);
+            _stats.SettingsRequested += ShowSettings;
             _stats.FormClosed += (_, _) =>
             {
                 SaveSettings();
@@ -212,14 +214,7 @@ internal sealed class TrayApp : ApplicationContext
         _speed.SmoothingSeconds = settings.SmoothingSeconds;
         _widget.ApplySettings(settings);
         SaveSettings();
-        if (_stats is not null)
-        {
-            // The stats form holds the settings it was created with; reopen it to pick up the new ones.
-            Rectangle bounds = _stats.Bounds;
-            _stats.Close();
-            ShowStatistics();
-            _stats!.Bounds = bounds;
-        }
+        _stats?.UseSettings(settings);
     }
 
     private void SaveSettings()
@@ -247,7 +242,7 @@ internal sealed class TrayApp : ApplicationContext
         try
         {
             IpcResponse adapters = await _client.CallAsync(Ops.Adapters);
-            _speed.SetCountedAdapters((adapters.Adapters ?? []).ToDictionary(a => a.Guid, a => a.CountsInTotal));
+            _speed.SetCountedAdapters(adapters.Adapters ?? []);
             IpcResponse status = await _client.CallAsync(Ops.Status);
             DateTime today = DateTime.Today;
             UsageBucket day = await SingleBucketAsync(BucketKind.Day, today, today.AddDays(1));
